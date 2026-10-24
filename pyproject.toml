@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pra-effect"
+version = "0.1.0"
+description = "Pra-Effect: local stack trace deduplication and incident fingerprinting CLI"
+requires-python = ">=3.9"
+license = { text = "Proprietary" }
+authors = [{ name = "Pra-Effect" }]
+dependencies = []
+
+[project.scripts]
+pra-effect = "pra_effect:main"
+
+[tool.setuptools]
+py-modules = ["pra_effect"]
