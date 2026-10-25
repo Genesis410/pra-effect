@@ -30,10 +30,9 @@ Untuk menghemat quota, TPM, dan context window model AI:
 
 ## 3. Current State & Version Roadmap
 - **Published on GitHub & PyPI:** `v1.0.1` (Patch release).
-- **Current Development Version:** `v1.1.0` (Security & CI Quality Gate: `--scrub-secrets`, `--fail-if-groups-exceed`).
+- **Current Development Version:** `v1.2.0` (Run Comparison & Historical Diffing: `pra-effect diff <run_a> <run_b>`, `--fail-on-new`).
 - **Target Selanjutnya:**
-  - `TSK-024` -> `v1.2.0` (Run Diffing: `pra-effect diff <run1> <run2>`).
-  - `TSK-025` -> `v1.3.0` (Diagnostic Intelligence: `--explain` via heuristics/LLM-ready prompt).
+  - `TSK-025` -> `v1.3.0` (Diagnostic Intelligence: Foreign Stacks, Java Parser, `--src` preview).
 
 ---
 
@@ -44,3 +43,11 @@ python -m unittest discover -s . -p "test_*.py"
 git status --short
 ```
 Semua test menggunakan library standar `unittest` dan wajib lulus 100%.
+
+---
+
+## 5. Model-Switching / Context Bootstrapping Protocol (Hemat Kuota)
+Jika sesi agent beralih model atau terkena context compaction:
+1. **Dilarang membaca seluruh `.confidential/`:** Cukup baca `AGENTS.md` (file ini) untuk memahami invariant, versi aktif, dan command verifikasi.
+2. **Kueri Targeted Node:** Jika butuh detail spesifik dari task yang dikerjakan, baca file `.confidential/knowledge/INDEX.md` baris ringkasan, atau lakukan `search_files` terarah pada ID task (misal `TSK-025`).
+3. **Kueri Kode Inti:** Selalu gunakan offset/search terarah di `pra_effect.py` (misal cari nama parser atau command CLI). Dilarang me-read seluruh 1500+ baris sekaligus.

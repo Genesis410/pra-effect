@@ -36,7 +36,7 @@ def test_release_version_consistency():
     assert pra_effect.__version__ == pkg_version, (
         f"version drift: CLI __version__={pra_effect.__version__} != pyproject={pkg_version}"
     )
-    assert pkg_version == "1.1.0", f"release expected 1.1.0, got {pkg_version}"
+    assert pkg_version == "1.2.0", f"release expected 1.2.0, got {pkg_version}"
 
 FIXTURE_PYTHON_LOG = """
 INFO 2026-10-24 10:00:01 Starting service
@@ -657,6 +657,64 @@ def test_scrub_secrets_and_ci_gate():
     assert "exceed threshold" in res_fail.stderr
 
 
+def test_diff_runs_and_ci_fail_on_new():
+    """TSK-024: pra-effect diff <run_a> <run_b> with new/resolved/persistent tracking."""
+    import subprocess
+    import tempfile
+    from pra_effect import diff_runs, format_diff_report, TracebackParser, group_traces, save_run_to_db
+
+    script = str(Path(__file__).parent / "pra_effect.py")
+    parser = TracebackParser()
+
+    with tempfile.TemporaryDirectory() as td:
+        db_file = Path(td) / "test_diff.db"
+
+        # Run 1: has ValueError and PermissionError (from FIXTURE_PYTHON_LOG)
+        groups1 = group_traces(parser.parse_all(FIXTURE_PYTHON_LOG))
+        run_id_1 = save_run_to_db(db_file, "ingest", 50, len(groups1), 5.0, groups1)
+
+        # Run 2: has Node errors (from FIXTURE_NODE_LOG)
+        groups2 = group_traces(parser.parse_all(FIXTURE_NODE_LOG))
+        run_id_2 = save_run_to_db(db_file, "ingest", 50, len(groups2), 6.0, groups2)
+
+        # Direct diff_runs check
+        diff_res = diff_runs(db_file, run_id_1, run_id_2)
+        assert len(diff_res["new"]) > 0
+        assert len(diff_res["resolved"]) > 0
+
+        report_txt = format_diff_report(diff_res)
+        assert "NEW INCIDENT GROUPS" in report_txt
+        assert "RESOLVED INCIDENT GROUPS" in report_txt
+
+        # Run 3: has both Python and Node errors to test persistent groups
+        groups3 = group_traces(parser.parse_all(FIXTURE_PYTHON_LOG + "\n" + FIXTURE_NODE_LOG))
+        run_id_3 = save_run_to_db(db_file, "ingest", 100, len(groups3), 8.0, groups3)
+
+        diff_persist = diff_runs(db_file, run_id_1, run_id_3)
+        assert len(diff_persist["persistent"]) == len(groups1)
+        assert len(diff_persist["new"]) > 0
+        assert len(diff_persist["resolved"]) == 0
+
+        # CLI diff invocation
+        cli_res = subprocess.run(
+            [sys.executable, script, "diff", str(run_id_1), str(run_id_2), "--db", str(db_file)],
+            capture_output=True,
+            text=True,
+        )
+        assert cli_res.returncode == 0
+        assert "NEW INCIDENT GROUPS" in cli_res.stdout
+        assert "RESOLVED INCIDENT GROUPS" in cli_res.stdout
+
+        # CLI diff --fail-on-new gate
+        cli_gate_fail = subprocess.run(
+            [sys.executable, script, "diff", str(run_id_1), str(run_id_2), "--db", str(db_file), "--fail-on-new"],
+            capture_output=True,
+            text=True,
+        )
+        assert cli_gate_fail.returncode == 2
+        assert "new incident group(s) detected" in cli_gate_fail.stderr
+
+
 class TestPraEffect(unittest.TestCase):
     """unittest bridge so `python -m unittest discover` runs the same suite."""
 
@@ -668,6 +726,9 @@ class TestPraEffect(unittest.TestCase):
 
     def test_scrub_secrets_and_ci_gate(self):
         test_scrub_secrets_and_ci_gate()
+
+    def test_diff_runs_and_ci_fail_on_new(self):
+        test_diff_runs_and_ci_fail_on_new()
 
     def test_message_normalization(self):
         test_message_normalization()

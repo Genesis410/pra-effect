@@ -4,6 +4,11 @@ Semua perubahan berarti bagi Pra-Effect tercatat di sini. Format mengikuti
 [Keep a Changelog](https://keepachangelog.com/) dan pemantauan
 [Semantic Versioning](https://semver.org/).
 
+## [1.2.0] - 2026-10-25
+### Added
+- `pra-effect diff <run_a> <run_b>`: historical run comparison detecting newly introduced, resolved, and persistent incident groups across SQLite history.
+- `--fail-on-new`: CI quality gate flag for `diff` returning exit code 2 when target run introduces any new incident groups.
+
 ## [1.1.0] - 2026-10-25
 ### Added
 - `--scrub-secrets`: redaction filter for Bearer tokens, JWTs, HTTP basic auth URI credentials, AWS access keys, and key-value secret assignments.

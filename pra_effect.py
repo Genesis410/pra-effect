@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Iterable, Iterator, List, Optional, Sequence, Tuple
 
 FINGERPRINT_VERSION = "fingerprint_v1"
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 MAX_LINE_LENGTH = 4096
 MAX_CONTINUATION_LINES = 5
 MAX_INTERLEAVED_LINES = 2
@@ -928,6 +928,108 @@ def query_recent_runs(db_path: Path, limit: int = 10) -> List[dict]:
     return [dict(r) for r in rows]
 
 
+def diff_runs(db_path: Path, run_id_a: int, run_id_b: int) -> dict:
+    """Compare two historical runs and compute newly introduced, resolved, and persistent groups (TSK-024)."""
+    if not db_path.exists():
+        raise FileNotFoundError(f"Database not found at {db_path}")
+
+    conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
+    with conn:
+        run_a = conn.execute("SELECT * FROM runs WHERE id = ?", (run_id_a,)).fetchone()
+        run_b = conn.execute("SELECT * FROM runs WHERE id = ?", (run_id_b,)).fetchone()
+        if not run_a:
+            conn.close()
+            raise ValueError(f"Run ID {run_id_a} not found in database")
+        if not run_b:
+            conn.close()
+            raise ValueError(f"Run ID {run_id_b} not found in database")
+
+        inc_a = {
+            r["fingerprint"]: dict(r)
+            for r in conn.execute("SELECT * FROM incidents WHERE run_id = ?", (run_id_a,)).fetchall()
+        }
+        inc_b = {
+            r["fingerprint"]: dict(r)
+            for r in conn.execute("SELECT * FROM incidents WHERE run_id = ?", (run_id_b,)).fetchall()
+        }
+    conn.close()
+
+    fps_a = set(inc_a.keys())
+    fps_b = set(inc_b.keys())
+
+    new_fps = fps_b - fps_a
+    resolved_fps = fps_a - fps_b
+    common_fps = fps_a & fps_b
+
+    new_groups = [inc_b[fp] for fp in sorted(new_fps)]
+    resolved_groups = [inc_a[fp] for fp in sorted(resolved_fps)]
+    persistent_groups = []
+    for fp in sorted(common_fps):
+        item_a = inc_a[fp]
+        item_b = inc_b[fp]
+        persistent_groups.append({
+            "fingerprint": fp,
+            "runtime": item_b["runtime"],
+            "error_type": item_b["error_type"],
+            "normalized_message": item_b["normalized_message"],
+            "occurrences_a": item_a["occurrences"],
+            "occurrences_b": item_b["occurrences"],
+            "delta_occurrences": item_b["occurrences"] - item_a["occurrences"],
+        })
+
+    return {
+        "run_a": dict(run_a),
+        "run_b": dict(run_b),
+        "new": new_groups,
+        "resolved": resolved_groups,
+        "persistent": persistent_groups,
+    }
+
+
+def format_diff_report(diff_res: dict) -> str:
+    """Format human-readable CLI report comparing two runs."""
+    ra = diff_res["run_a"]
+    rb = diff_res["run_b"]
+    lines = [
+        "Pra-Effect — Run Comparison (Diff)",
+        f"Base Run #{ra['id']} ({ra['timestamp_utc']}) vs Target Run #{rb['id']} ({rb['timestamp_utc']})",
+        "=" * 68,
+        f"Base Run   : {ra['unique_groups']} groups, {ra['total_exceptions']} total exceptions",
+        f"Target Run : {rb['unique_groups']} groups, {rb['total_exceptions']} total exceptions",
+        "-" * 68,
+        f"Summary: +{len(diff_res['new'])} NEW | -{len(diff_res['resolved'])} RESOLVED | ={len(diff_res['persistent'])} PERSISTENT",
+        "=" * 68,
+    ]
+
+    if diff_res["new"]:
+        lines.append("\n[+] NEW INCIDENT GROUPS (Introduced in Target Run):")
+        for item in diff_res["new"]:
+            lines.append(f"  + [{item['runtime'].upper()}] {item['error_type']} (#{item['fingerprint']})")
+            lines.append(f"    Occurrences: {item['occurrences']}")
+            if item.get("normalized_message"):
+                lines.append(f"    Message    : {item['normalized_message']}")
+
+    if diff_res["resolved"]:
+        lines.append("\n[-] RESOLVED INCIDENT GROUPS (Cleared in Target Run):")
+        for item in diff_res["resolved"]:
+            lines.append(f"  - [{item['runtime'].upper()}] {item['error_type']} (#{item['fingerprint']})")
+            lines.append(f"    Prior Occurrences: {item['occurrences']}")
+            if item.get("normalized_message"):
+                lines.append(f"    Prior Message    : {item['normalized_message']}")
+
+    if diff_res["persistent"]:
+        lines.append("\n[=] PERSISTENT GROUPS (Present in Both):")
+        for item in diff_res["persistent"]:
+            delta_sign = f"+{item['delta_occurrences']}" if item["delta_occurrences"] > 0 else f"{item['delta_occurrences']}"
+            lines.append(
+                f"  = [{item['runtime'].upper()}] {item['error_type']} (#{item['fingerprint']}) "
+                f"({item['occurrences_a']} -> {item['occurrences_b']}, delta: {delta_sign})"
+            )
+
+    return "\n".join(lines)
+
+
 def generate_html_report(
     total_lines: int,
     total_exceptions: int,
@@ -1285,6 +1387,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     hist_p.add_argument("--db", type=str, default=None, help="Path to SQLite database file")
     hist_p.add_argument("--limit", type=int, default=15, help="Number of records to show")
 
+    # Diff (TSK-024)
+    diff_p = subparsers.add_parser("diff", help="Compare two historical runs to see new, resolved, and persistent groups")
+    diff_p.add_argument("run_a", type=int, help="Base run ID (older)")
+    diff_p.add_argument("run_b", type=int, help="Target run ID (newer)")
+    diff_p.add_argument("--db", type=str, default=None, help="Path to SQLite database file")
+    diff_p.add_argument("--fail-on-new", action="store_true", help="CI gate: return exit code 2 if target run introduced new incident groups")
+
     args = parser.parse_args(argv)
     if not args.command:
         if not sys.stdin.isatty():
@@ -1332,6 +1441,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             if inc["normalized_message"]:
                 print(f"    Message:    {inc['normalized_message']}")
             print("-" * 60)
+        return 0
+
+    if cmd == "diff":
+        if not db_path.exists():
+            sys.stderr.write(f"Error: Database not found at {db_path}\n")
+            return 1
+        try:
+            diff_res = diff_runs(db_path, args.run_a, args.run_b)
+        except Exception as e:
+            sys.stderr.write(f"Error: {e}\n")
+            return 1
+        print(format_diff_report(diff_res))
+        if getattr(args, "fail_on_new", False) and len(diff_res["new"]) > 0:
+            sys.stderr.write(f"\n[Pra-Effect Gate] Failed: {len(diff_res['new'])} new incident group(s) detected.\n")
+            return 2
         return 0
 
     src_dir = Path(src_val) if src_val else cwd
