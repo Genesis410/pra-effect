@@ -40,6 +40,16 @@
 pip install pra-effect
 ```
 
+Run directly via the registered console command:
+```bash
+pra-effect --help
+```
+
+Or run as a Python module (useful if user-installed scripts directory is not in your system PATH):
+```bash
+python -m pra_effect --help
+```
+
 ### Standalone (Zero Install)
 You can directly invoke the script without installation:
 ```bash
