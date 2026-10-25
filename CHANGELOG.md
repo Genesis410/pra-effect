@@ -4,6 +4,11 @@ Semua perubahan berarti bagi Pra-Effect tercatat di sini. Format mengikuti
 [Keep a Changelog](https://keepachangelog.com/) dan pemantauan
 [Semantic Versioning](https://semver.org/).
 
+## [1.1.0] - 2026-10-25
+### Added
+- `--scrub-secrets`: redaction filter for Bearer tokens, JWTs, HTTP basic auth URI credentials, AWS access keys, and key-value secret assignments.
+- `--fail-if-groups-exceed <N>`: CI quality gate flag returning exit code 2 when deduplicated incident groups exceed threshold.
+
 ## [1.0.1] - 2026-10-25
 
 ### Fixed

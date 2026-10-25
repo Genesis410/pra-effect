@@ -36,7 +36,7 @@ def test_release_version_consistency():
     assert pra_effect.__version__ == pkg_version, (
         f"version drift: CLI __version__={pra_effect.__version__} != pyproject={pkg_version}"
     )
-    assert pkg_version == "1.0.1", f"release expected 1.0.1, got {pkg_version}"
+    assert pkg_version == "1.1.0", f"release expected 1.1.0, got {pkg_version}"
 
 FIXTURE_PYTHON_LOG = """
 INFO 2026-10-24 10:00:01 Starting service
@@ -604,6 +604,59 @@ def test_graceful_interrupt_handling():
     assert "ValueError" in res.stdout
 
 
+def test_scrub_secrets_and_ci_gate():
+    """TSK-023: Redact sensitive credentials and CI gate on threshold."""
+    import subprocess
+    from pra_effect import scrub_secrets_text, stream_analyze
+
+    # 1. Direct helper scrub test
+    dirty_text = (
+        "Failed with Authorization: Bearer eyJhbGciOi.eyJzdWIi.signature123 "
+        "and db=postgres://admin:supersecret@db.internal:5432/prod "
+        "api_key='abc12345xyz' AWS_KEY=AKIAIOSFODNN7EXAMPLE"
+    )
+    scrubbed = scrub_secrets_text(dirty_text)
+    assert "supersecret" not in scrubbed
+    assert "admin:[REDACTED]@" in scrubbed
+    assert "[REDACTED_AWS_KEY]" in scrubbed
+    assert "[REDACTED_JWT]" in scrubbed
+
+    # 2. Stream analyze with scrub_secrets=True
+    raw_lines = [
+        'Traceback (most recent call last):',
+        '  File "/app/auth.py", line 10, in authenticate',
+        '    raise PermissionError("Bearer eyJhbGciOi.eyJzdWIi.signature123 rejected")',
+        'PermissionError: Bearer eyJhbGciOi.eyJzdWIi.signature123 rejected',
+    ]
+    _, _, groups = stream_analyze(raw_lines, cwd=Path("/app"), scrub_secrets=True)
+    assert len(groups) == 1
+    assert "eyJhbGciOi" not in groups[0].representative_trace
+    assert "[REDACTED_JWT]" in groups[0].representative_trace
+
+    # 3. CLI Quality Gate: --fail-if-groups-exceed
+    script = str(Path(__file__).parent / "pra_effect.py")
+    log_sample = (
+        "Traceback (most recent call last):\n  File \"a.py\", line 1, in m\nValueError: v1\n"
+        "Traceback (most recent call last):\n  File \"b.py\", line 2, in n\nTypeError: t1\n"
+    )
+    res_pass = subprocess.run(
+        [sys.executable, script, "ingest", "--fail-if-groups-exceed", "2"],
+        input=log_sample,
+        capture_output=True,
+        text=True,
+    )
+    assert res_pass.returncode == 0
+
+    res_fail = subprocess.run(
+        [sys.executable, script, "ingest", "--fail-if-groups-exceed", "1"],
+        input=log_sample,
+        capture_output=True,
+        text=True,
+    )
+    assert res_fail.returncode == 2
+    assert "exceed threshold" in res_fail.stderr
+
+
 class TestPraEffect(unittest.TestCase):
     """unittest bridge so `python -m unittest discover` runs the same suite."""
 
@@ -612,6 +665,9 @@ class TestPraEffect(unittest.TestCase):
 
     def test_graceful_interrupt_handling(self):
         test_graceful_interrupt_handling()
+
+    def test_scrub_secrets_and_ci_gate(self):
+        test_scrub_secrets_and_ci_gate()
 
     def test_message_normalization(self):
         test_message_normalization()

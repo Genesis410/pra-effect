@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Iterable, Iterator, List, Optional, Sequence, Tuple
 
 FINGERPRINT_VERSION = "fingerprint_v1"
-__version__ = "1.0.1"
+__version__ = "1.1.0"
 MAX_LINE_LENGTH = 4096
 MAX_CONTINUATION_LINES = 5
 MAX_INTERLEAVED_LINES = 2
@@ -50,6 +50,13 @@ RE_DYNAMIC_ID = re.compile(
 RE_CONSECUTIVE_WHITESPACE = re.compile(r"\s+")
 # TSK-022 / v1.0.1: ANSI escape code stripping in stream reader
 RE_ANSI = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
+
+# TSK-023 / v1.1.0: Secret redaction patterns
+RE_BEARER_AUTH = re.compile(r"(?i)\b(bearer\s+)([A-Za-z0-9\-_\.=]{16,})")
+RE_BASIC_AUTH_URI = re.compile(r"(?i)\b([a-z][a-z0-9+.-]*://)([^:\s/@]+):([^@\s/]+)@")
+RE_API_KEY_KV = re.compile(r"(?i)\b(api[_-]?key|secret|token|password|passwd|auth)[_-]?(?:key)?\s*[:=]\s*['\"]?([A-Za-z0-9_\-\.]{8,})['\"]?")
+RE_AWS_KEY = re.compile(r"\b(AKIA[0-9A-Z]{16})\b")
+RE_JWT = re.compile(r"\beyJ[A-Za-z0-9-_]+\.eyJ[A-Za-z0-9-_]+\.[A-Za-z0-9-_]+\b")
 
 # Python traceback pattern
 RE_PY_TRACE_START = re.compile(r"^Traceback \(most recent call last\):")
@@ -558,6 +565,23 @@ def strip_ansi(text: str) -> str:
     return RE_ANSI.sub("", text) if "\x1b" in text else text
 
 
+def scrub_secrets_text(text: str) -> str:
+    """Scrub sensitive credentials (JWT, Bearer, API keys, URIs) from trace text (TSK-023)."""
+    if not text:
+        return text
+    # 1. JWT token (before bearer strip so standard JWT gets explicit REDACTED_JWT)
+    text = RE_JWT.sub("[REDACTED_JWT]", text)
+    # 2. Bearer token
+    text = RE_BEARER_AUTH.sub(r"\1[REDACTED]", text)
+    # 3. Basic auth in URLs: http://user:pass@host -> http://user:[REDACTED]@host
+    text = RE_BASIC_AUTH_URI.sub(r"\1\2:[REDACTED]@", text)
+    # 4. AWS access key
+    text = RE_AWS_KEY.sub("[REDACTED_AWS_KEY]", text)
+    # 5. Key-value secrets: api_key = "xyz" -> api_key = "[REDACTED]"
+    text = RE_API_KEY_KV.sub(r"\1=[REDACTED]", text)
+    return text
+
+
 def iter_pairs(lines: Iterable[str], max_bytes: Optional[int] = None) -> Iterator[Tuple[str, bool]]:
     """Truncate-to-4096 pre-check (ReDoS guard), ANSI strip, plus --max-input-mb backstop."""
     used = 0
@@ -582,6 +606,7 @@ def stream_analyze(
     cwd: Path,
     src_dir: Optional[Path] = None,
     max_bytes: Optional[int] = None,
+    scrub_secrets: bool = False,
 ) -> Tuple[int, int, List[IncidentGroup]]:
     """Single-pass streaming analysis: (total_lines, total_exceptions, groups).
 
@@ -611,6 +636,10 @@ def stream_analyze(
     total_exceptions += len(nl2)
 
     merged = {**fpy, **fnode}
+    if scrub_secrets:
+        for g in merged.values():
+            g.representative_trace = scrub_secrets_text(g.representative_trace)
+            g.normalized_message = scrub_secrets_text(g.normalized_message)
     groups = sorted(merged.values(), key=lambda g: g.occurrences, reverse=True)
     return total_lines, total_exceptions, groups
 
@@ -1226,6 +1255,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ingest_p.add_argument("--html", type=str, default=None, help="Generate standalone interactive HTML report")
     ingest_p.add_argument("--max-input-mb", type=float, default=DEFAULT_MAX_INPUT_MB,
                           help="Input size backstop in MB (0 disables; streaming already bounds memory)")
+    ingest_p.add_argument("--scrub-secrets", action="store_true",
+                          help="Redact Bearer tokens, JWT, passwords, and API keys from outputs (TSK-023)")
+    ingest_p.add_argument("--fail-if-groups-exceed", type=int, default=None,
+                          help="CI Quality Gate: exit code 2 if unique incident groups exceed N (TSK-023)")
 
     # Scan
     scan_p = subparsers.add_parser("scan", help="Scan log file or directory")
@@ -1242,6 +1275,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     scan_p.add_argument("--html", type=str, default=None, help="Generate standalone interactive HTML report")
     scan_p.add_argument("--max-input-mb", type=float, default=DEFAULT_MAX_INPUT_MB,
                         help="Input size backstop in MB (0 disables; streaming already bounds memory)")
+    scan_p.add_argument("--scrub-secrets", action="store_true",
+                        help="Redact Bearer tokens, JWT, passwords, and API keys from outputs (TSK-023)")
+    scan_p.add_argument("--fail-if-groups-exceed", type=int, default=None,
+                        help="CI Quality Gate: exit code 2 if unique incident groups exceed N (TSK-023)")
 
     # History
     hist_p = subparsers.add_parser("history", help="View historical incident aggregation")
@@ -1256,6 +1293,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             save_val = False
             db_val = None
             html_val = None
+            scrub_secrets_val = False
+            fail_groups_threshold = None
         else:
             parser.print_help()
             return 2
@@ -1265,6 +1304,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         save_val = getattr(args, "save", False)
         db_val = getattr(args, "db", None)
         html_val = getattr(args, "html", None)
+        scrub_secrets_val = getattr(args, "scrub_secrets", False)
+        fail_groups_threshold = getattr(args, "fail_if_groups_exceed", None)
 
     cwd = Path.cwd()
     default_db = cwd / ".pra-effect" / "traces.db"
@@ -1311,7 +1352,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 return 1
             source = iter_scan_lines(target, args.pattern)
         total_lines, total_exceptions, groups = stream_analyze(
-            source, cwd, src_dir, max_bytes
+            source, cwd, src_dir, max_bytes, scrub_secrets=scrub_secrets_val
         )
     except (InputTooLargeError, ScanInputError) as e:
         sys.stderr.write(f"{e}\n")
@@ -1352,6 +1393,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         )
         html_out_path.write_text(html_content, encoding="utf-8")
         print(f"[Pra-Effect] Interactive HTML report saved to {html_out_path}")
+
+    # TSK-023: CI quality gate check
+    if fail_groups_threshold is not None and len(groups) > fail_groups_threshold:
+        sys.stderr.write(
+            f"\n[Pra-Effect CI Gate] Failure: unique incident groups ({len(groups)}) "
+            f"exceed threshold ({fail_groups_threshold})\n"
+        )
+        return 2
 
     return 0
 

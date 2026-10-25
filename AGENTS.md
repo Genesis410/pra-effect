@@ -29,10 +29,9 @@ Untuk menghemat quota, TPM, dan context window model AI:
 ---
 
 ## 3. Current State & Version Roadmap
-- **Published on GitHub & PyPI:** `v1.0.0` (Latest release).
-- **Current Development Version:** `v1.0.1` (Reliability Patch: ANSI stripping, SIGINT/BrokenPipe handling).
+- **Published on GitHub & PyPI:** `v1.0.1` (Patch release).
+- **Current Development Version:** `v1.1.0` (Security & CI Quality Gate: `--scrub-secrets`, `--fail-if-groups-exceed`).
 - **Target Selanjutnya:**
-  - `TSK-023` -> `v1.1.0` (Secure & CI-Ready: `--scrub-secrets`, `--fail-if-groups-exceed`).
   - `TSK-024` -> `v1.2.0` (Run Diffing: `pra-effect diff <run1> <run2>`).
   - `TSK-025` -> `v1.3.0` (Diagnostic Intelligence: `--explain` via heuristics/LLM-ready prompt).
 
