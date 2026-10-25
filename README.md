@@ -2,6 +2,7 @@
 
 > Zero-dependency local CLI for parsing, deduplicating, and fingerprinting Python & Node.js error stack traces with low-memory streaming ingestion ($O(1)$ reader, $O(G)$ unique-group memory), ReDoS resilience, SQLite persistence, and standalone HTML reporting.
 
+[![PyPI Version](https://img.shields.io/pypi/v/pra-effect.svg)](https://pypi.org/project/pra-effect/)
 [![Python Version](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![Dependencies](https://img.shields.io/badge/dependencies-zero-brightgreen.svg)]()
@@ -34,17 +35,22 @@
 
 ## Installation
 
-### From Source (Editable / Tool Mode)
+### From PyPI (Recommended)
 ```bash
-git clone https://github.com/Genesis410/pra-effect.git
-cd pra-effect
-pip install -e .
+pip install pra-effect
 ```
 
 ### Standalone (Zero Install)
 You can directly invoke the script without installation:
 ```bash
 python pra_effect.py --help
+```
+
+### From Source (Editable / Development Mode)
+```bash
+git clone https://github.com/Genesis410/pra-effect.git
+cd pra-effect
+pip install -e .
 ```
 
 ---
@@ -179,6 +185,12 @@ Tests cover:
 ## License
 
 MIT License. See [LICENSE](LICENSE) for details.
+
+---
+
+## Star History
+
+[![Star History Chart](https://api.star-history.com/svg?repos=Genesis410/pra-effect&type=Date)](https://star-history.com/#Genesis410/pra-effect&Date)
 
 ---
 
