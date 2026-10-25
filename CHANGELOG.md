@@ -4,7 +4,15 @@ Semua perubahan berarti bagi Pra-Effect tercatat di sini. Format mengikuti
 [Keep a Changelog](https://keepachangelog.com/) dan pemantauan
 [Semantic Versioning](https://semver.org/).
 
-## [1.0.0] — 2026-10-25
+## [1.0.1] - 2026-10-25
+
+### Fixed
+- **ANSI Escape Code Stripping:** Added automatic per-line ANSI escape stripping (`\x1b\[[0-9;]*[a-zA-Z]`) in the stream reader pipeline. Colored stack traces from terminal loggers (e.g. Rich, chalk, pytest) now produce identical fingerprints and error groupings as plain logs.
+- **Graceful Process Interruption:** Handled `BrokenPipeError` (exit code 0) and `KeyboardInterrupt` / SIGINT (exit code 130) cleanly across `ingest` and `scan` pipelines without dumping Python runtime tracebacks to stderr.
+
+---
+
+## [1.0.0] - 2026-10-25
 
 ### Added
 - Streaming state-machine parser (`PythonTraceStream`, `NodeTraceStream`) — ingestion

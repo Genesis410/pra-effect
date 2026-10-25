@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Iterable, Iterator, List, Optional, Sequence, Tuple
 
 FINGERPRINT_VERSION = "fingerprint_v1"
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 MAX_LINE_LENGTH = 4096
 MAX_CONTINUATION_LINES = 5
 MAX_INTERLEAVED_LINES = 2
@@ -48,6 +48,8 @@ RE_DYNAMIC_ID = re.compile(
     re.IGNORECASE,
 )
 RE_CONSECUTIVE_WHITESPACE = re.compile(r"\s+")
+# TSK-022 / v1.0.1: ANSI escape code stripping in stream reader
+RE_ANSI = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
 
 # Python traceback pattern
 RE_PY_TRACE_START = re.compile(r"^Traceback \(most recent call last\):")
@@ -551,10 +553,17 @@ def fold_traces(traces: Iterable[ParsedTrace], groups: "dict[str, IncidentGroup]
                 g.is_truncated = True
 
 
+def strip_ansi(text: str) -> str:
+    """Strip ANSI escape sequences from text (TSK-022)."""
+    return RE_ANSI.sub("", text) if "\x1b" in text else text
+
+
 def iter_pairs(lines: Iterable[str], max_bytes: Optional[int] = None) -> Iterator[Tuple[str, bool]]:
-    """Truncate-to-4096 pre-check (ReDoS guard) plus --max-input-mb backstop."""
+    """Truncate-to-4096 pre-check (ReDoS guard), ANSI strip, plus --max-input-mb backstop."""
     used = 0
     for raw in lines:
+        if "\x1b" in raw:
+            raw = RE_ANSI.sub("", raw)
         if max_bytes is not None:
             used += len(raw.encode("utf-8", "replace")) + 1
             if used > max_bytes:
@@ -1307,6 +1316,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     except (InputTooLargeError, ScanInputError) as e:
         sys.stderr.write(f"{e}\n")
         return 1
+    except KeyboardInterrupt:
+        # TSK-022 / v1.0.1: Graceful SIGINT exit (130) without unhandled Python traceback
+        sys.stderr.write("\n[Pra-Effect] Interrupted by user\n")
+        return 130
+    except BrokenPipeError:
+        # TSK-022 / v1.0.1: Standard UNIX pipe break (e.g. head -n)
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(devnull, sys.stdout.fileno())
+        return 0
 
     duration_s = time.perf_counter() - t_start
     report = format_terminal_report(total_lines, total_exceptions, groups, duration_s)
@@ -1339,4 +1357,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except BrokenPipeError:
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(devnull, sys.stdout.fileno())
+        sys.exit(0)
+    except KeyboardInterrupt:
+        sys.stderr.write("\n[Pra-Effect] Interrupted by user\n")
+        sys.exit(130)

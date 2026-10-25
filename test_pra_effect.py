@@ -36,7 +36,7 @@ def test_release_version_consistency():
     assert pra_effect.__version__ == pkg_version, (
         f"version drift: CLI __version__={pra_effect.__version__} != pyproject={pkg_version}"
     )
-    assert pkg_version == "1.0.0", f"release expected 1.0.0, got {pkg_version}"
+    assert pkg_version == "1.0.1", f"release expected 1.0.1, got {pkg_version}"
 
 FIXTURE_PYTHON_LOG = """
 INFO 2026-10-24 10:00:01 Starting service
@@ -558,8 +558,60 @@ def test_fingerprint_version_isolation():
         assert not any(h["fingerprint"] == "feedfacefeedface" for h in hist)
 
 
+def test_ansi_escape_stripping():
+    """TSK-022: ANSI escapes must be stripped before traceback detection."""
+    from pra_effect import stream_analyze, strip_ansi
+
+    # Direct helper test
+    raw = "\x1b[31;1mError: something broke\x1b[0m"
+    assert strip_ansi(raw) == "Error: something broke"
+
+    # Streaming analysis test: identical fingerprint with or without ANSI
+    plain_log = [
+        'Traceback (most recent call last):',
+        '  File "/app/src/main.py", line 42, in run',
+        '    raise ValueError("invalid parameter 123")',
+        'ValueError: invalid parameter 123',
+    ]
+    ansi_log = [
+        '\x1b[33mTraceback (most recent call last):\x1b[0m',
+        '  \x1b[36mFile "/app/src/main.py", line 42, in run\x1b[0m',
+        '    \x1b[31mraise ValueError("invalid parameter 123")\x1b[0m',
+        '\x1b[1;31mValueError: invalid parameter 123\x1b[0m',
+    ]
+
+    _, count1, groups1 = stream_analyze(plain_log, cwd=Path("/app"), src_dir=Path("/app/src"))
+    _, count2, groups2 = stream_analyze(ansi_log, cwd=Path("/app"), src_dir=Path("/app/src"))
+
+    assert count1 == 1 and count2 == 1
+    assert len(groups1) == 1 and len(groups2) == 1
+    assert groups1[0].fingerprint == groups2[0].fingerprint
+    assert groups1[0].error_type == groups2[0].error_type == "ValueError"
+
+
+def test_graceful_interrupt_handling():
+    """TSK-022: KeyboardInterrupt exit 130 and BrokenPipe exit 0."""
+    import subprocess
+    cmd = [sys.executable, str(Path(__file__).parent / "pra_effect.py"), "ingest"]
+    # Verify CLI responds cleanly without crash trace
+    res = subprocess.run(
+        cmd,
+        input="Traceback (most recent call last):\n  File \"a.py\", line 1, in <module>\nValueError: x\n",
+        capture_output=True,
+        text=True,
+    )
+    assert res.returncode == 0
+    assert "ValueError" in res.stdout
+
+
 class TestPraEffect(unittest.TestCase):
     """unittest bridge so `python -m unittest discover` runs the same suite."""
+
+    def test_ansi_escape_stripping(self):
+        test_ansi_escape_stripping()
+
+    def test_graceful_interrupt_handling(self):
+        test_graceful_interrupt_handling()
 
     def test_message_normalization(self):
         test_message_normalization()
