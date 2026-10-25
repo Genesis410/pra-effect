@@ -4,6 +4,14 @@ Semua perubahan berarti bagi Pra-Effect tercatat di sini. Format mengikuti
 [Keep a Changelog](https://keepachangelog.com/) dan pemantauan
 [Semantic Versioning](https://semver.org/).
 
+## [1.3.0] - 2026-10-25
+### Added
+- **Java Stack Trace Support:** Streaming parser for Java exceptions (`JavaTraceStream`, `RE_JAVA_*`), including standard multiline stack traces and chained exception context (`Caused by:` -> `ParsedTrace.chain`).
+- **Vendor Frame Filtering:** Automatic suppression/classification of runtime and framework internals (`java.`, `javax.`, `jdk.`, `sun.`, `org.springframework.`, `org.apache.`, `org.junit.`).
+- **Foreign Crash Detection:** Heuristic classification (`RE_FOREIGN_HEADER`) for unrecognized foreign stack traces and crash dumps with dedicated visual badge.
+- **Sandboxed Source Context Preview (`--src`):** Secure source code preview in HTML reports with strict directory containment check (`os.path.commonpath`) to prevent path traversal and symlink escapes.
+- **Visual Diagnostics:** New `.badge-java` and `.badge-foreign` status tags with dedicated styling in generated HTML reports.
+
 ## [1.2.0] - 2026-10-25
 ### Added
 - `pra-effect diff <run_a> <run_b>`: historical run comparison detecting newly introduced, resolved, and persistent incident groups across SQLite history.

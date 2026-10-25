@@ -1,6 +1,6 @@
 # Pra-Effect
 
-> Zero-dependency local CLI for parsing, deduplicating, and fingerprinting Python & Node.js error stack traces with low-memory streaming ingestion ($O(1)$ reader, $O(G)$ unique-group memory), ReDoS resilience, SQLite persistence, and standalone HTML reporting.
+> Zero-dependency local CLI for parsing, deduplicating, and fingerprinting Python, Node.js, and Java error stack traces with low-memory streaming ingestion ($O(1)$ reader, $O(G)$ unique-group memory), ReDoS resilience, SQLite persistence, and standalone HTML reporting with sandboxed source previews.
 
 [![PyPI Version](https://img.shields.io/pypi/v/pra-effect.svg)](https://pypi.org/project/pra-effect/)
 [![Python Version](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/)
@@ -13,7 +13,12 @@
 
 - **Zero Third-Party Dependencies:** Pure Python standard library (`argparse`, `hashlib`, `html`, `re`, `sqlite3`, `pathlib`).
 - **Resilient Fingerprinting (`fingerprint_v1`):** Normalizes dynamic memory addresses (`0x7f...`), variable line numbers, timestamps, UUIDs, and ephemeral ports so identical incidents aggregate into one canonical hash.
-- **Dual Runtime Support:** Natively parses Python tracebacks (standard, chained exceptions, multiline messages) and Node.js call stacks (V8 engine).
+- **Polyglot Runtime Support:** Natively parses Python tracebacks (standard, chained exceptions, multiline messages), Node.js call stacks (V8 engine), and Java stack traces (`Caused by:` exception chaining, vendor package suppression). Automatically flags unrecognized foreign crash dumps.
+- **Diagnostic Source Previews (`--src`):** Embeds sandboxed 5-line source code context around target frames in HTML incident reports with strict directory containment check (`os.path.commonpath`).
+- **CI & Regression Quality Gates:**
+  - `--fail-if-groups-exceed <N>` to guard against incident sprawl.
+  - `pra-effect diff <run_a> <run_b> --fail-on-new` to block builds introducing new unhandled error groups.
+- **Automated Secret Scrubbing (`--scrub-secrets`):** Zero-regex-leak masking of Bearer tokens, JWTs, URI credentials, AWS access keys, and passwords.
 - **Robust Input Handling:**
   - Hard line truncation at 4,096 characters to prevent catastrophic regex backtracking (ReDoS).
   - Interleaving tolerance up to 2 lines of interleaved non-trace log noise.
@@ -119,6 +124,21 @@ First Seen:   2026-10-24 16:30:00 UTC
 Last Seen:    2026-10-24 16:45:12 UTC
 ```
 
+### 4. Regression Diffing (CI Quality Gate)
+Compare two test runs from SQLite history to detect newly introduced errors:
+
+```bash
+# Compare runs and fail build (exit code 2) if new incident groups appeared
+pra-effect diff run_123 run_124 --fail-on-new
+```
+
+### 5. Diagnostics with Source Code Previews
+Generate HTML report embedding 5-line source snippets around failing frames:
+
+```bash
+pra-effect scan /var/log/app.log --src ./src --html report.html
+```
+
 ---
 
 ## Architecture & Data Flow
@@ -206,7 +226,7 @@ MIT License. See [LICENSE](LICENSE) for details.
 
 ## Release & Changelog
 
-See [CHANGELOG.md](CHANGELOG.md) for the version history. Current release: `1.0.0`.
+See [CHANGELOG.md](CHANGELOG.md) for the version history. Current release: `1.3.0`.
 
 Version consistency across the package (`pyproject.toml`), the CLI (`--version`), and
 the git tag is enforced by `test_release_version_consistency`.
