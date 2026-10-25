@@ -467,6 +467,38 @@ def test_max_input_mb_backstop():
     assert p2.returncode == 0, p2.stderr
 
 
+def test_streaming_pipeline_memory_regression():
+    """RSK-005 / DEC-017 regression test: streaming pipeline consumption must stay bounded.
+    Feeding 10,000 tracebacks through PythonTraceStream must not grow tracemalloc > 500 KB.
+    """
+    import tracemalloc
+    from pra_effect import PythonTraceStream
+
+    block_lines = [
+        "INFO 2026-10-24 10:00:01 request\n",
+        "Traceback (most recent call last):\n",
+        '  File "/app/src/worker.py", line 15, in process\n',
+        "    raise ValueError('bad')\n",
+        "ValueError: bad\n",
+        "\n",
+    ]
+
+    stream = PythonTraceStream(cwd=REPO_DIR)
+    tracemalloc.start()
+    collected = 0
+    for _ in range(10000):
+        for line in block_lines:
+            traces = stream.feed(line, False)
+            collected += len(traces)
+    collected += len(stream.finish())
+    peak_bytes, _ = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+
+    assert collected == 10000, f"Expected 10000 parsed traces, got {collected}"
+    peak_kb = peak_bytes / 1024
+    assert peak_kb < 500, f"Streaming pipeline memory leaked: {peak_kb:.1f} KB >= 500 KB"
+
+
 def test_fingerprint_version_isolation():
     """TSK-012: foreign fingerprint versions never leak into aggregated history."""
     from pra_effect import init_db, query_historical_incidents, save_run_to_db
@@ -555,6 +587,9 @@ class TestPraEffect(unittest.TestCase):
 
     def test_max_input_mb_backstop(self):
         test_max_input_mb_backstop()
+
+    def test_streaming_pipeline_memory_regression(self):
+        test_streaming_pipeline_memory_regression()
 
 
 if __name__ == "__main__":
