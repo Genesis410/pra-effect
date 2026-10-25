@@ -1,6 +1,6 @@
 # Pra-Effect
 
-> Zero-dependency local CLI for parsing, deduplicating, and fingerprinting Python & Node.js error stack traces with sub-second execution, ReDoS resilience, SQLite persistence, and standalone HTML reporting.
+> Zero-dependency local CLI for parsing, deduplicating, and fingerprinting Python & Node.js error stack traces with low-memory streaming ingestion ($O(1)$ reader, $O(G)$ unique-group memory), ReDoS resilience, SQLite persistence, and standalone HTML reporting.
 
 [![Python Version](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
@@ -18,7 +18,13 @@
   - Interleaving tolerance up to 2 lines of interleaved non-trace log noise.
   - Bounded message collection: log lines (`INFO ...`, timestamps) never leak into an error message.
   - Chained Python exceptions collapse to a single root incident (causes kept as diagnostic context, never split the fingerprint).
-- **Streaming Architecture:** input is parsed line-by-line through state machines — memory scales with the number of *unique incidents* $O(G)$, not input size ($O(1)$ streaming ingestion with 0.0047 MB tracemalloc). Optional `--max-input-mb` backstop rejects oversized raw log files (default 100 MB, 0 disables).
+- **Streaming Architecture & Performance:**
+  - Input parsed line-by-line through state machines — reader memory footprint is $O(1)$ (0.0047 MB tracemalloc for pure stream ingestion).
+  - Total memory scales with the number of *unique incident groups* $O(G)$, not total input byte size ($G$ distinct error patterns retained in memory).
+  - Benchmark (Python 3.14 on Windows, synthetic multi-group logs):
+    - *Typical log stream (28.2 MB, ~72k traces, ~6.8k unique groups):* ~6.1 MB Python heap, ~36.5 MB Peak RSS (GATE-MEM-01B PASS).
+    - *Adversarial high-cardinality stream (21.4 MB, ~54k traces, ~44.7k unique groups):* ~39.8 MB Python heap, ~106 MB Peak RSS (characterized in DEC-017).
+  - Optional `--max-input-mb` backstop rejects oversized raw log files (default 100 MB, 0 disables).
 - **Local Persistence & Export:**
   - WAL-mode SQLite storage for thread-safe concurrent writes and query performance.
   - Self-contained, single-file HTML reports with zero external CDN assets.

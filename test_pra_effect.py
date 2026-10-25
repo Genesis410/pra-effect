@@ -458,7 +458,11 @@ def test_golden_cli_parity():
         assert scrub(p.stdout) == want, f"stdout drift vs baseline: {out_name}"
         err_file = gold / (out_name + ".stderr")
         if err_file.exists():
-            assert p.stderr.strip() == err_file.read_text(encoding="utf-8").strip(), (
+            # Scrub machine-dependent absolute repo path for cross-environment portability
+            scrubbed_actual_err = p.stderr.replace(str(REPO_DIR), "<REPO_DIR>").replace("\\", "/")
+            want_raw = err_file.read_text(encoding="utf-8")
+            scrubbed_want_err = want_raw.replace(str(REPO_DIR), "<REPO_DIR>").replace("\\", "/")
+            assert scrubbed_actual_err.strip() == scrubbed_want_err.strip(), (
                 f"stderr drift vs baseline: {out_name}"
             )
 
