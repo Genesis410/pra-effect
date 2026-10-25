@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Iterable, Iterator, List, Optional, Sequence, Tuple
 
 FINGERPRINT_VERSION = "fingerprint_v1"
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 MAX_LINE_LENGTH = 4096
 MAX_CONTINUATION_LINES = 5
 MAX_INTERLEAVED_LINES = 2
@@ -84,6 +84,22 @@ RE_NODE_FRAME = re.compile(
     r"^\s*at (?:(.+?)\s+\()?([^\s\(\)]+?):(\d+):(\d+)\)?$"
 )
 
+# Java stack patterns (TSK-025)
+RE_JAVA_HEADER = re.compile(
+    r"^(?:Exception in thread \"[^\"]*\"\s+)?([a-zA-Z0-9_$]+\.[a-zA-Z0-9_$.]+(?:Exception|Error|Throwable))(?::\s*(.*))?$"
+)
+RE_JAVA_FRAME = re.compile(
+    r"^\s*at\s+([a-zA-Z0-9_$./<>]+)\((?:([^:]+):(\d+)|Native Method|Unknown Source)\)"
+)
+RE_JAVA_CAUSED_BY = re.compile(
+    r"^Caused by:\s+([a-zA-Z0-9_$.]+(?:Exception|Error|Throwable))(?::\s*(.*))?$"
+)
+
+# Foreign stack patterns (Go panic, C++ core dumps, Rust panics) (TSK-025)
+RE_FOREIGN_HEADER = re.compile(
+    r"^(?:panic:\s*(.*)|fatal error:\s*(.*)|SIGSEGV|SIGABRT|thread '[^']+' panicked at)"
+)
+
 # Known vendor / runtime directory segments
 VENDOR_SEGMENTS = {
     "site-packages",
@@ -96,6 +112,21 @@ VENDOR_SEGMENTS = {
     "venv",
     "virtualenv",
 }
+
+JAVA_VENDOR_PREFIXES = (
+    "java.",
+    "javax.",
+    "jdk.",
+    "sun.",
+    "com.sun.",
+    "org.springframework.",
+    "org.apache.catalina.",
+    "org.apache.tomcat.",
+    "org.eclipse.jetty.",
+    "io.netty.",
+    "org.hibernate.",
+    "org.junit.",
+)
 
 
 @dataclass
@@ -114,7 +145,7 @@ class StackFrame:
 
 @dataclass
 class ParsedTrace:
-    runtime: str  # "python" | "node"
+    runtime: str  # "python" | "node" | "java" | "foreign"
     error_type: str
     original_message: str
     normalized_message: str
@@ -123,6 +154,7 @@ class ParsedTrace:
     fingerprint: str = ""
     timestamp: Optional[str] = None
     is_truncated: bool = False
+    chain: Optional["ParsedTrace"] = None
 
     def compute_fingerprint(self) -> str:
         # 1. Project frames prioritized
@@ -533,6 +565,158 @@ class NodeTraceStream:
         return trace
 
 
+class JavaTraceStream:
+    """Line-fed Java stack trace parser with Caused-by chaining support (TSK-025)."""
+
+    def __init__(self, cwd: Path, src_dir: Optional[Path] = None):
+        self.cwd = cwd
+        self.src_dir = src_dir
+        self.pend: "deque[Tuple[str, bool]]" = deque()
+        self._reset()
+
+    def _reset(self) -> None:
+        self.mode = "idle"  # idle | await | frames
+        self.frames: List[StackFrame] = []
+        self.trace_lines: List[Tuple[str, bool]] = []
+        self.trunc_any = False
+        self.interleaved = 0
+        self.err_type = ""
+        self.raw_msg = ""
+        self.chain_target: Optional[ParsedTrace] = None
+
+    def feed(self, line: str, truncated: bool) -> List[ParsedTrace]:
+        self.pend.append((line, truncated))
+        return self._drain()
+
+    def finish(self) -> List[ParsedTrace]:
+        out = self._drain()
+        if self.mode == "frames":
+            out.append(self._make_trace())
+        self._reset()
+        return out
+
+    def _drain(self) -> List[ParsedTrace]:
+        out: List[ParsedTrace] = []
+        stall = 0
+        while self.pend:
+            line, truncated = self.pend[0]
+            if self._step(line, truncated, out):
+                self.pend.popleft()
+                stall = 0
+            else:
+                stall += 1
+                if stall > 10_000:
+                    raise RuntimeError("JavaTraceStream made no progress")
+        return out
+
+    def _step(self, line: str, truncated: bool, out: List[ParsedTrace]) -> bool:
+        stripped = line.strip()
+
+        if self.mode == "idle":
+            # Match Java header (e.g. Exception in thread "main" java.lang.NullPointerException: msg)
+            header = RE_JAVA_HEADER.match(stripped)
+            if header and ("Exception" in header.group(1) or "Error" in header.group(1) or "Throwable" in header.group(1)):
+                self.err_type = header.group(1)
+                self.raw_msg = header.group(2) or ""
+                self.mode = "await"
+                self.frames = []
+                self.trace_lines = [(line, truncated)]
+                self.trunc_any = truncated
+                self.interleaved = 0
+                self.chain_target = None
+                return True
+            return True  # noise
+
+        if self.mode == "await":
+            if not stripped:
+                return True
+            if stripped.startswith("at "):
+                self.mode = "frames"
+                return False  # re-dispatch under frame rules
+            self._reset()
+            return False
+
+        # mode == "frames"
+        if not stripped:
+            return True
+
+        # Check Caused by: chaining marker
+        caused = RE_JAVA_CAUSED_BY.match(stripped)
+        if caused:
+            # Previous trace becomes parent or gets chained
+            parent = self._make_trace()
+            out.append(parent)
+            self.err_type = caused.group(1)
+            self.raw_msg = caused.group(2) or ""
+            self.frames = []
+            self.trace_lines.append((line, truncated))
+            self.chain_target = parent
+            self.mode = "await"
+            return True
+
+        if stripped.startswith("... ") and "more" in stripped:
+            self.trace_lines.append((line, truncated))
+            return True
+
+        frame_match = RE_JAVA_FRAME.match(line)
+        if frame_match:
+            method_path = frame_match.group(1)
+            file_name = frame_match.group(2) or ""
+            line_str = frame_match.group(3)
+            line_no = int(line_str) if line_str else 0
+
+            # Vendor exclusion check
+            is_vendor = any(method_path.startswith(prefix) for prefix in JAVA_VENDOR_PREFIXES)
+            in_proj = not is_vendor
+
+            norm_p, path_in_proj = normalize_frame_path(file_name, self.cwd, self.src_dir) if file_name else (method_path, False)
+            if not is_vendor:
+                in_proj = True
+
+            self.frames.append(
+                StackFrame(
+                    filepath=file_name or method_path,
+                    line_number=line_no,
+                    function_name=method_path,
+                    is_in_project=in_proj,
+                    normalized_path=norm_p or method_path,
+                )
+            )
+            self.trace_lines.append((line, truncated))
+            self.trunc_any = self.trunc_any or truncated
+            self.interleaved = 0
+            return True
+
+        if RE_JAVA_HEADER.match(stripped) or RE_PY_TRACE_START.match(stripped) or RE_NODE_ERROR_HEADER.match(stripped):
+            out.append(self._make_trace())
+            self._reset()
+            return False
+
+        if self.interleaved < MAX_INTERLEAVED_LINES:
+            self.interleaved += 1
+            return True
+
+        out.append(self._make_trace())
+        self._reset()
+        return False
+
+    def _make_trace(self) -> ParsedTrace:
+        raw_block = "\n".join(l for l, _ in self.trace_lines)
+        norm_msg, is_trunc = normalize_message(self.raw_msg)
+        trace = ParsedTrace(
+            runtime="java",
+            error_type=self.err_type,
+            original_message=self.raw_msg,
+            normalized_message=norm_msg,
+            frames=self.frames,
+            raw_text=raw_block,
+            is_truncated=is_trunc or self.trunc_any,
+            chain=self.chain_target,
+        )
+        trace.fingerprint = trace.compute_fingerprint()
+        return trace
+
+
 def fold_traces(traces: Iterable[ParsedTrace], groups: "dict[str, IncidentGroup]") -> None:
     """Incrementally fold traces into a fingerprint->IncidentGroup bucket."""
     for t in traces:
@@ -610,14 +794,16 @@ def stream_analyze(
 ) -> Tuple[int, int, List[IncidentGroup]]:
     """Single-pass streaming analysis: (total_lines, total_exceptions, groups).
 
-    Both machines see every line; folds stay separate so the merged bucket
-    preserves python-insertion-then-node-insertion order — byte-identical to
-    the former two-pass parse_all() + single group_traces() call.
+    All state machines see every line; folds stay separate so the merged bucket
+    preserves insertion order across runtimes.
     """
     py = PythonTraceStream(cwd, src_dir)
     node = NodeTraceStream(cwd, src_dir)
+    java = JavaTraceStream(cwd, src_dir)
     fpy: "dict[str, IncidentGroup]" = {}
     fnode: "dict[str, IncidentGroup]" = {}
+    fjava: "dict[str, IncidentGroup]" = {}
+    fforeign: "dict[str, IncidentGroup]" = {}
     total_lines = 0
     total_exceptions = 0
     for line, truncated in iter_pairs(lines, max_bytes):
@@ -628,14 +814,48 @@ def stream_analyze(
         nl = node.feed(line, truncated)
         fold_traces(nl, fnode)
         total_exceptions += len(nl)
+        jl = java.feed(line, truncated)
+        fold_traces(jl, fjava)
+        total_exceptions += len(jl)
+
+        # Foreign stack detection (Go panic, fatal errors, core dumps)
+        fmatch = RE_FOREIGN_HEADER.match(line.strip())
+        if fmatch and not tl and not nl and not jl:
+            header_str = line.strip()
+            err_type = "ForeignPanic"
+            if "SIGSEGV" in header_str:
+                err_type = "SIGSEGV"
+            elif "SIGABRT" in header_str:
+                err_type = "SIGABRT"
+            elif "panic:" in header_str:
+                err_type = "GoPanic"
+            elif "fatal error:" in header_str:
+                err_type = "FatalError"
+
+            ftrace = ParsedTrace(
+                runtime="foreign",
+                error_type=err_type,
+                original_message=header_str,
+                normalized_message=header_str,
+                frames=[],
+                raw_text=line,
+                is_truncated=truncated,
+            )
+            ftrace.fingerprint = ftrace.compute_fingerprint()
+            fold_traces([ftrace], fforeign)
+            total_exceptions += 1
+
     fl = py.finish()
     fold_traces(fl, fpy)
     total_exceptions += len(fl)
     nl2 = node.finish()
     fold_traces(nl2, fnode)
     total_exceptions += len(nl2)
+    jl2 = java.finish()
+    fold_traces(jl2, fjava)
+    total_exceptions += len(jl2)
 
-    merged = {**fpy, **fnode}
+    merged = {**fpy, **fnode, **fjava, **fforeign}
     if scrub_secrets:
         for g in merged.values():
             g.representative_trace = scrub_secrets_text(g.representative_trace)
@@ -758,10 +978,15 @@ class TracebackParser:
         """Whole-text convenience API — thin wrapper over the streaming machine."""
         return _collect_stream(NodeTraceStream(self.cwd, self.src_dir), text.splitlines())
 
+    def parse_java_traces(self, text: str) -> List[ParsedTrace]:
+        """Whole-text convenience API — thin wrapper over the streaming machine (TSK-025)."""
+        return _collect_stream(JavaTraceStream(self.cwd, self.src_dir), text.splitlines())
+
     def parse_all(self, text: str) -> List[ParsedTrace]:
         py_traces = self.parse_python_traces(text)
         node_traces = self.parse_node_traces(text)
-        return py_traces + node_traces
+        java_traces = self.parse_java_traces(text)
+        return py_traces + node_traces + java_traces
 
 
 def group_traces(traces: Iterable[ParsedTrace]) -> List[IncidentGroup]:
@@ -1030,11 +1255,50 @@ def format_diff_report(diff_res: dict) -> str:
     return "\n".join(lines)
 
 
+def get_source_preview(file_path_str: str, target_line: int, src_dir: Optional[Path]) -> Optional[str]:
+    """Read 5 lines of source context (target_line +/- 2) safely. (TSK-025)
+
+    Guards against symlink traversal and escapes beyond src_dir.
+    """
+    if not src_dir or not file_path_str or target_line <= 0:
+        return None
+
+    try:
+        resolved_src = src_dir.resolve()
+        candidate = (src_dir / file_path_str).resolve()
+        # Verify containment
+        if os.path.commonpath([resolved_src, candidate]) != str(resolved_src):
+            return None
+        if not candidate.is_file():
+            return None
+
+        with open(candidate, "r", encoding="utf-8", errors="replace") as f:
+            all_lines = f.readlines()
+
+        total = len(all_lines)
+        if target_line > total:
+            return None
+
+        start = max(1, target_line - 2)
+        end = min(total, target_line + 2)
+
+        preview_lines = []
+        for i in range(start, end + 1):
+            marker = " > " if i == target_line else "   "
+            line_content = all_lines[i - 1].rstrip("\r\n")
+            preview_lines.append(f"{marker}{i:4d} | {line_content}")
+
+        return "\n".join(preview_lines)
+    except Exception:
+        return None
+
+
 def generate_html_report(
     total_lines: int,
     total_exceptions: int,
     groups: Sequence[IncidentGroup],
     duration_s: float,
+    src_dir: Optional[Path] = None,
 ) -> str:
     num_groups = len(groups)
     acr = (total_exceptions / num_groups) if num_groups > 0 else 0.0
@@ -1042,6 +1306,24 @@ def generate_html_report(
     cards_html = []
     for idx, g in enumerate(groups, start=1):
         loc = ", ".join(g.project_locations) if g.project_locations else "unknown frame"
+
+        # Check for source preview
+        preview_html = ""
+        if src_dir and g.project_locations:
+            # First project location e.g. "app.py:42" or "src/Main.java:15"
+            first_loc = g.project_locations[0]
+            if ":" in first_loc:
+                f_path, f_line = first_loc.rsplit(":", 1)
+                if f_line.isdigit():
+                    preview_text = get_source_preview(f_path, int(f_line), src_dir)
+                    if preview_text:
+                        preview_html = f"""
+            <details class="source-preview" style="margin-top:0.5rem; background: #161b22; border: 1px solid var(--border); border-radius: 4px; padding: 0.5rem;">
+                <summary style="cursor:pointer; font-weight:600; color:var(--text); font-size:0.85rem;">Source Context ({html.escape(first_loc)})</summary>
+                <pre style="margin:0.5rem 0 0; font-family:monospace; font-size:0.8rem; overflow-x:auto;">{html.escape(preview_text)}</pre>
+            </details>
+            """
+
         cards_html.append(
             f"""
         <div class="incident-card" data-runtime="{html.escape(g.runtime)}" data-text="{html.escape((g.error_type + ' ' + g.normalized_message + ' ' + g.fingerprint).lower())}">
@@ -1057,6 +1339,7 @@ def generate_html_report(
                 <span><strong>Location:</strong> {html.escape(loc)}</span>
             </div>
             {f'<div class="card-message"><code>{html.escape(g.normalized_message)}</code></div>' if g.normalized_message else ''}
+            {preview_html}
             <details class="trace-details">
                 <summary>Stack Trace Excerpt <button type="button" class="btn-copy" onclick="copyTrace(this, event)">Copy Trace</button></summary>
                 <pre class="trace-block">{html.escape(g.representative_trace)}</pre>
@@ -1157,6 +1440,8 @@ def generate_html_report(
         }}
         .badge-node {{ background: rgba(34, 197, 94, 0.2); color: var(--accent-node); border: 1px solid var(--accent-node); }}
         .badge-python {{ background: rgba(59, 130, 246, 0.2); color: var(--accent-python); border: 1px solid var(--accent-python); }}
+        .badge-java {{ background: rgba(176, 114, 25, 0.2); color: #b07219; border: 1px solid #b07219; }}
+        .badge-foreign {{ background: rgba(239, 68, 68, 0.2); color: #ef4444; border: 1px solid #ef4444; }}
         .error-type {{ font-size: 1.1rem; font-weight: bold; margin-left: 0.5rem; }}
         .fingerprint {{ font-family: monospace; color: var(--muted); font-size: 0.85rem; margin-left: 0.5rem; }}
         .occurrences {{ font-size: 0.95rem; color: var(--primary); }}
@@ -1514,6 +1799,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             total_exceptions=total_exceptions,
             groups=groups,
             duration_s=duration_s,
+            src_dir=src_dir,
         )
         html_out_path.write_text(html_content, encoding="utf-8")
         print(f"[Pra-Effect] Interactive HTML report saved to {html_out_path}")

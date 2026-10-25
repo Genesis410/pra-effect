@@ -36,7 +36,7 @@ def test_release_version_consistency():
     assert pra_effect.__version__ == pkg_version, (
         f"version drift: CLI __version__={pra_effect.__version__} != pyproject={pkg_version}"
     )
-    assert pkg_version == "1.2.0", f"release expected 1.2.0, got {pkg_version}"
+    assert pkg_version == "1.3.0", f"release expected 1.3.0, got {pkg_version}"
 
 FIXTURE_PYTHON_LOG = """
 INFO 2026-10-24 10:00:01 Starting service
@@ -780,6 +780,51 @@ class TestPraEffect(unittest.TestCase):
 
     def test_release_version_consistency(self):
         test_release_version_consistency()
+
+    def test_java_parser_and_caused_by(self):
+        java_log = """
+Exception in thread "main" java.lang.RuntimeException: Failed to process order
+\tat com.example.service.OrderService.process(OrderService.java:45)
+\tat com.example.controller.OrderController.post(OrderController.java:20)
+\tat org.springframework.web.method.support.InvocableHandlerMethod.invoke(InvocableHandlerMethod.java:190)
+Caused by: java.lang.NullPointerException: Order payload is null
+\tat com.example.service.OrderService.validate(OrderService.java:80)
+\tat com.example.service.OrderService.process(OrderService.java:40)
+\t... 2 more
+"""
+        cwd = Path(".")
+        parser = pra_effect.TracebackParser(cwd=cwd)
+        traces = parser.parse_java_traces(java_log)
+        self.assertEqual(len(traces), 2)
+        # Caused by trace
+        self.assertEqual(traces[0].error_type, "java.lang.RuntimeException")
+        self.assertEqual(traces[1].error_type, "java.lang.NullPointerException")
+        # Check vendor exclusion: org.springframework frame should not be in project
+        spring_frames = [f for f in traces[0].frames if "InvocableHandlerMethod" in f.function_name]
+        self.assertTrue(spring_frames)
+        self.assertFalse(spring_frames[0].is_in_project)
+        # Service frames should be in project
+        service_frames = [f for f in traces[0].frames if "OrderService" in f.function_name]
+        self.assertTrue(service_frames)
+        self.assertTrue(service_frames[0].is_in_project)
+
+    def test_source_preview_sandboxing(self):
+        with tempfile.TemporaryDirectory() as td:
+            src_dir = Path(td)
+            code_file = src_dir / "Test.java"
+            code_file.write_text("line 1\nline 2\nline 3\nline 4\nline 5\nline 6\nline 7\n", encoding="utf-8")
+            
+            # Legitimate preview
+            preview = pra_effect.get_source_preview("Test.java", 4, src_dir)
+            self.assertIsNotNone(preview)
+            assert preview is not None
+            self.assertIn(">    4 | line 4", preview)
+            self.assertIn("line 2", preview)
+            self.assertIn("line 6", preview)
+
+            # Traversal escape outside src_dir rejected
+            outside_preview = pra_effect.get_source_preview("../../../etc/passwd", 1, src_dir)
+            self.assertIsNone(outside_preview)
 
 
 if __name__ == "__main__":
