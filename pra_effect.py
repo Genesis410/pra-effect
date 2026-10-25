@@ -14,6 +14,7 @@ import sqlite3
 import sys
 import time
 from dataclasses import asdict, dataclass, field
+from functools import lru_cache
 from pathlib import Path
 from typing import Iterable, List, Optional, Sequence, Tuple
 
@@ -37,6 +38,19 @@ RE_CONSECUTIVE_WHITESPACE = re.compile(r"\s+")
 RE_PY_TRACE_START = re.compile(r"^Traceback \(most recent call last\):")
 RE_PY_FRAME = re.compile(r'^\s*File "([^"]+)", line (\d+), in (\S+)')
 RE_PY_ERROR = re.compile(r"^([a-zA-Z_][a-zA-Z0-9_\.]*(?:Error|Exception|Exit|Interrupt|Warning|Fault))(?::\s*(.*))?$")
+
+# Chained exception marker (DEC-011): separates cause traceback from outer root traceback
+RE_CHAIN_MARKER = re.compile(
+    r"^(?:During handling of the above exception, another exception occurred:|"
+    r"The above exception was the direct cause of the following exception:)$"
+)
+
+# Bounded message collector boundary: stop when a normal log line begins (DEC-006 + TSK-007)
+RE_LOG_LEVEL_LINE = re.compile(
+    r"^(?:\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:[.,]\d+)?\s+)?"
+    r"(?:DEBUG|INFO|NOTICE|WARNING|WARN|ERROR|CRITICAL|TRACE)\b"
+)
+RE_TIMESTAMP_LINE = re.compile(r"^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:[.,]\d+)?\s+\S")
 
 # Node.js stack pattern
 RE_NODE_ERROR_HEADER = re.compile(
@@ -130,6 +144,7 @@ def normalize_message(msg: str) -> Tuple[str, bool]:
     return m.strip(), truncated
 
 
+@lru_cache(maxsize=8192)
 def normalize_frame_path(raw_path: str, cwd: Path, src_override: Optional[Path] = None) -> Tuple[str, bool]:
     clean = raw_path.replace("\\", "/")
     # Check vendor segments
@@ -173,6 +188,8 @@ class TracebackParser:
 
         i = 0
         n = len(lines)
+        # DEC-011: cause tracebacks parked until their outer root traceback appears
+        pending_causes: List[Tuple[ParsedTrace, str]] = []
 
         while i < n:
             line = lines[i]
@@ -224,6 +241,9 @@ class TracebackParser:
                             and not RE_PY_FRAME.match(lines[i])
                             and not RE_PY_ERROR.match(lines[i].strip())
                             and not RE_NODE_ERROR_HEADER.match(lines[i].strip())
+                            and not RE_CHAIN_MARKER.match(lines[i].strip())
+                            and not RE_LOG_LEVEL_LINE.match(lines[i].strip())
+                            and not RE_TIMESTAMP_LINE.match(lines[i].strip())
                         ):
                             extra_lines.append(lines[i].strip())
                             trace_lines.append(lines[i])
@@ -239,6 +259,16 @@ class TracebackParser:
 
                         end_idx = i
                         raw_block = "\n".join(trace_lines)
+                        if pending_causes:
+                            # DEC-011: outermost exception owns the incident; causes ride along
+                            # as diagnostic context only (never enter the fingerprint payload).
+                            parts: List[str] = []
+                            for cause_trace, marker_line in pending_causes:
+                                parts.append(cause_trace.raw_text)
+                                parts.append(marker_line)
+                            parts.append(raw_block)
+                            raw_block = "\n".join(parts)
+                            pending_causes = []
                         norm_msg, is_trunc = normalize_message(raw_msg)
                         any_trunc = is_trunc or any(lines_truncated[start_idx:end_idx])
                         trace = ParsedTrace(
@@ -268,7 +298,15 @@ class TracebackParser:
                         i = start_idx + 1
                         break
             else:
+                stripped = line.strip()
+                if RE_CHAIN_MARKER.match(stripped) and traces:
+                    # This completed traceback is a cause; hold it for the next (outer) traceback.
+                    pending_causes.append((traces.pop(), stripped))
                 i += 1
+
+        # Log truncated mid-chain: keep parked causes as standalone traces instead of dropping them
+        for cause_trace, _marker in pending_causes:
+            traces.append(cause_trace)
         return traces
 
     def parse_node_traces(self, text: str) -> List[ParsedTrace]:
@@ -519,13 +557,17 @@ def query_historical_incidents(db_path: Path, limit: int = 20) -> List[dict]:
     conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row
     with conn:
+        # Fingerprint immutability contract (TSK-012): history only ever
+        # aggregates rows written under the active fingerprint version, so a future
+        # fingerprint_v2 can never rewrite or pollute v1 history.
         rows = conn.execute(
             """
             SELECT * FROM v_historical_incidents
+            WHERE fingerprint_version = ?
             ORDER BY total_seen_count DESC
             LIMIT ?
             """,
-            (limit,),
+            (FINGERPRINT_VERSION, limit),
         ).fetchall()
     conn.close()
     return [dict(r) for r in rows]
@@ -761,6 +803,12 @@ def generate_html_report(
         <main id="incidentList">
             {all_cards}
         </main>
+
+        <footer style="margin-top: 2rem; padding-top: 1rem; border-top: 1px solid var(--border); color: var(--muted); font-size: 0.8rem;">
+            Generated by Pra-Effect. All log content is HTML-escaped.
+            Fingerprint normalization (UUID/hex/ID) is <strong>not</strong> PII redaction —
+            tokens, emails, or secrets inside log messages appear as-is. Share with care.
+        </footer>
     </div>
 
     <script>
@@ -839,6 +887,11 @@ def format_terminal_report(
     if len(groups) > 5:
         out.append(f"... and {len(groups) - 5} more groups.")
 
+    out.append("")
+    out.append(
+        "NOTE: fingerprint normalization (UUID/hex/ID) is NOT PII redaction — "
+        "tokens, emails, or secrets inside log messages are shown as-is."
+    )
     return "\n".join(out)
 
 
@@ -846,6 +899,53 @@ class PraEffectArgumentParser(argparse.ArgumentParser):
     def error(self, message: str):
         sys.stderr.write(f"Error: {message}\n")
         sys.exit(2)
+
+
+def read_log_file(path: Path) -> Tuple[Optional[str], Optional[str]]:
+    """Read one log file. Returns (text, None) on success or (None, skip_reason)."""
+    try:
+        data = path.read_bytes()
+    except OSError as e:
+        return None, f"unreadable ({e.strerror or e})"
+    if b"\x00" in data[:8192]:
+        return None, "binary content (NUL byte)"
+    return data.decode("utf-8", errors="replace"), None
+
+
+def read_scan_target(target: Path, pattern: str) -> Tuple[Optional[str], int, int]:
+    """Read an explicit file or glob a directory (DEC-012).
+
+    Returns (text, files_seen, files_read). text is None when an explicit file
+    fails, or when a directory yielded zero readable files.
+    """
+    if target.is_file():
+        text, reason = read_log_file(target)
+        if text is None:
+            sys.stderr.write(f"Error: cannot read {target}: {reason}\n")
+            return None, 1, 0
+        return text, 1, 1
+
+    globs = [p.strip() for p in pattern.split(",") if p.strip()]
+    seen: dict = {}
+    for g in globs:
+        for f in sorted(target.glob(f"**/{g}")):
+            if f.is_file():
+                seen[f] = None
+    buf: List[str] = []
+    read_ok = 0
+    for f in seen:
+        text, reason = read_log_file(f)
+        if text is None:
+            sys.stderr.write(f"[Pra-Effect] skipped {f}: {reason}\n")
+            continue
+        buf.append(text)
+        read_ok += 1
+    if read_ok == 0:
+        sys.stderr.write(
+            f"Error: no readable log files matched pattern '{pattern}' in {target}\n"
+        )
+        return None, len(seen), 0
+    return "\n".join(buf), len(seen), read_ok
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -862,6 +962,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # Scan
     scan_p = subparsers.add_parser("scan", help="Scan log file or directory")
     scan_p.add_argument("path", type=str, help="Path to file or directory")
+    scan_p.add_argument(
+        "--pattern",
+        type=str,
+        default="*.log,*.txt",
+        help="Comma-separated glob patterns for directory scanning (default: *.log,*.txt)",
+    )
     scan_p.add_argument("--src", type=str, default=None, help="Project source directory")
     scan_p.add_argument("--save", action="store_true", help="Save run into local SQLite history")
     scan_p.add_argument("--db", type=str, default=None, help="Path to SQLite database file")
@@ -928,14 +1034,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if not target.exists():
             sys.stderr.write(f"Error: path not found {target}\n")
             return 1
-        if target.is_file():
-            raw_text = target.read_text(encoding="utf-8", errors="replace")
-        elif target.is_dir():
-            buf = []
-            for f in target.glob("**/*.log"):
-                if f.is_file():
-                    buf.append(f.read_text(encoding="utf-8", errors="replace"))
-            raw_text = "\n".join(buf)
+        raw_text, _seen, _read = read_scan_target(target, args.pattern)
+        if raw_text is None:
+            return 1
 
     t_parser = TracebackParser(cwd=cwd, src_dir=src_dir)
     traces = t_parser.parse_all(raw_text)

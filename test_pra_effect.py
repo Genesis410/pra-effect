@@ -1,11 +1,27 @@
-"""test_pra_effect.py - Verification suite for Pra-Effect grouping rules."""
+"""test_pra_effect.py - Verification suite for Pra-Effect grouping rules.
 
+Runs two ways (TSK-010):
+  python -m unittest discover -s <repo>
+  python test_pra_effect.py
+Both work from any working directory.
+"""
+
+import subprocess
+import sys
+import tempfile
+import unittest
 from pathlib import Path
+
+REPO_DIR = Path(__file__).resolve().parent
+SCRIPT = REPO_DIR / "pra_effect.py"
+if str(REPO_DIR) not in sys.path:
+    sys.path.insert(0, str(REPO_DIR))
+
 from pra_effect import (
+    FINGERPRINT_VERSION,
     TracebackParser,
     group_traces,
     normalize_message,
-    normalize_frame_path,
 )
 
 FIXTURE_PYTHON_LOG = """
@@ -47,6 +63,24 @@ TypeError: Cannot read properties of undefined (reading 'token')
     at authMiddleware (/app/src/auth.js:20:10)
     at processTicksAndRejections (internal/process/task_queues.js:95:5)
 """
+
+# --- Phase 2 fixtures (TSK-007) ---
+CHAIN_ROOT_ONLY_LOG = """Traceback (most recent call last):
+  File "/app/src/api.py", line 55, in get_profile
+    data = query(uid)
+  File "/app/src/db.py", line 12, in query
+    raise KeyError("user 42")
+KeyError: failed to load profile
+"""
+
+CHAINED_PYTHON_LOG = """Traceback (most recent call last):
+  File "/app/src/db.py", line 12, in query
+    raise KeyError("user 42")
+KeyError: user 42
+
+During handling of the above exception, another exception occurred:
+
+""" + CHAIN_ROOT_ONLY_LOG
 
 
 def test_message_normalization():
@@ -176,6 +210,8 @@ ValidationError: Validation failed:
     assert len(traces) == 1
     assert "Field 'username'" in traces[0].original_message
     assert "invalid format" in traces[0].original_message
+    # Bounded collector boundary (TSK-007): log lines never join the message
+    assert "Processing next" not in traces[0].original_message
 
 
 def test_line_length_truncation_redos():
@@ -236,41 +272,217 @@ ConnectionError: DB unreachable
 
 
 def test_exit_codes():
-    import subprocess
-    import sys
-    py_exec = sys.executable
-
     # 1. Valid execution with errors -> Exit 0
     p0 = subprocess.run(
-        [py_exec, "pra_effect.py", "ingest"],
+        [sys.executable, str(SCRIPT), "ingest"],
         input=FIXTURE_PYTHON_LOG,
         text=True,
         capture_output=True,
+        cwd=str(REPO_DIR),
     )
     assert p0.returncode == 0, f"Expected exit 0 on valid ingest, got {p0.returncode}"
 
     # 2. File not found -> Exit 1
     p1 = subprocess.run(
-        [py_exec, "pra_effect.py", "scan", "non_existent_log_file_12345.log"],
+        [sys.executable, str(SCRIPT), "scan", "non_existent_log_file_12345.log"],
         capture_output=True,
+        cwd=str(REPO_DIR),
     )
     assert p1.returncode == 1, f"Expected exit 1 on missing file, got {p1.returncode}"
 
     # 3. Invalid CLI args -> Exit 2
     p2 = subprocess.run(
-        [py_exec, "pra_effect.py", "--invalid-unknown-flag"],
+        [sys.executable, str(SCRIPT), "--invalid-unknown-flag"],
         capture_output=True,
+        cwd=str(REPO_DIR),
     )
     assert p2.returncode == 2, f"Expected exit 2 on CLI parse error, got {p2.returncode}"
 
 
+# --- Phase 2 tests (TSK-007..TSK-012) ---
+
+
+def test_chained_exception_single_root_incident():
+    """DEC-011: outermost exception is the incident; causes stay diagnostic context."""
+    parser = TracebackParser(cwd=Path("/app"), src_dir=Path("/app"))
+    traces = parser.parse_python_traces(CHAINED_PYTHON_LOG)
+    assert len(traces) == 1, f"Chained block must collapse to 1 root incident, got {len(traces)}"
+
+    root = traces[0]
+    assert root.error_type == "KeyError"
+    # Root identity = outermost exception message only
+    assert root.normalized_message == "failed to load profile", root.normalized_message
+    # Cause kept as context in raw_text (rendered), never in the payload
+    assert "During handling of the above exception" in root.raw_text
+    assert "KeyError: user 42" in root.raw_text
+
+    isolated = parser.parse_python_traces(CHAIN_ROOT_ONLY_LOG)[0]
+    assert root.fingerprint == isolated.fingerprint, (
+        "Root fingerprint must not change when cause details change"
+    )
+    assert len(group_traces(traces)) == 1
+
+
+def test_collector_stops_at_log_lines():
+    text = '''Traceback (most recent call last):
+  File "/app/src/x.py", line 3, in run
+    boom()
+RuntimeError: connection lost
+2026-10-24 10:00:00 INFO service recovered
+DEBUG worker pool refilled
+'''
+    parser = TracebackParser(cwd=Path("/app"))
+    traces = parser.parse_python_traces(text)
+    assert len(traces) == 1
+    assert "recovered" not in traces[0].original_message
+    assert "refilled" not in traces[0].original_message
+
+
+def test_scan_pattern_and_skip_policy():
+    """DEC-012: --pattern globbing, binary/unreadable skip, explicit failure signals."""
+    with tempfile.TemporaryDirectory() as td:
+        tdp = Path(td)
+        (tdp / "a.log").write_text(FIXTURE_PYTHON_LOG, encoding="utf-8")
+        (tdp / "b.txt").write_text("INFO healthy run\n", encoding="utf-8")
+        (tdp / "c.log").write_bytes(b"\x00\x01binary payload")
+
+        # Directory scan: binary skipped with stderr warning, readable files analyzed -> 0
+        p = subprocess.run(
+            [sys.executable, str(SCRIPT), "scan", str(tdp)],
+            capture_output=True, text=True, cwd=str(REPO_DIR),
+        )
+        assert p.returncode == 0, f"dir scan should succeed, got {p.returncode}: {p.stderr}"
+        assert "skipped" in p.stderr and "binary" in p.stderr, p.stderr
+
+        # Explicit binary file target -> hard failure 1
+        p1 = subprocess.run(
+            [sys.executable, str(SCRIPT), "scan", str(tdp / "c.log")],
+            capture_output=True, text=True, cwd=str(REPO_DIR),
+        )
+        assert p1.returncode == 1, f"explicit unreadable file must exit 1, got {p1.returncode}"
+        assert "cannot read" in p1.stderr
+
+        # --pattern custom glob with no match -> explicit failure, not silent empty success
+        p2 = subprocess.run(
+            [sys.executable, str(SCRIPT), "scan", str(tdp), "--pattern", "*.md"],
+            capture_output=True, text=True, cwd=str(REPO_DIR),
+        )
+        assert p2.returncode == 1, f"zero readable files must exit 1, got {p2.returncode}"
+        assert "no readable log files" in p2.stderr, p2.stderr
+
+        # --pattern selects only *.txt
+        p3 = subprocess.run(
+            [sys.executable, str(SCRIPT), "scan", str(tdp), "--pattern", "*.txt"],
+            capture_output=True, text=True, cwd=str(REPO_DIR),
+        )
+        assert p3.returncode == 0, p3.stderr
+        assert "ValueError" not in p3.stdout, "*.txt pattern must not read a.log"
+
+
+def test_html_escapes_all_trace_fields():
+    """DEC-013: every rendered token is escaped; disclaimer present."""
+    from pra_effect import IncidentGroup, generate_html_report
+
+    xss = "<script>alert(1)</script>"
+    g = IncidentGroup(
+        fingerprint="abc123def456",
+        runtime="python",
+        error_type=f"Error{xss}",
+        normalized_message=xss,
+        occurrences=3,
+        representative_trace=f'  File "{xss}", line 1, in run_{xss}\n{xss}',
+        project_locations=[f"{xss}:1"],
+    )
+    doc = generate_html_report(10, 1, [g], 0.01)
+    import html as html_mod
+    assert xss not in doc, "Raw XSS payload leaked into HTML output"
+    assert html_mod.escape(xss) in doc, "Escaped form missing"
+    assert "PII redaction" in doc, "PII disclaimer footer missing"
+
+
+def test_fingerprint_version_isolation():
+    """TSK-012: foreign fingerprint versions never leak into aggregated history."""
+    from pra_effect import init_db, query_historical_incidents, save_run_to_db
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db_path = Path(tmpdir) / "test_traces.db"
+        parser = TracebackParser()
+        traces = parser.parse_all(FIXTURE_PYTHON_LOG)
+        groups = group_traces(traces)
+        save_run_to_db(
+            db_path=db_path, command="scan", total_lines=10,
+            total_exceptions=len(traces), duration_ms=5.0, groups=groups,
+        )
+
+        # Inject a future-version row directly (simulates post-migration data)
+        conn = init_db(db_path)
+        with conn:
+            cur = conn.cursor()
+            cur.execute(
+                "INSERT INTO runs (timestamp_utc, command, total_lines, total_exceptions,"
+                " unique_groups, duration_ms, fingerprint_version)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                ("2030-01-01T00:00:00+00:00", "scan", 1, 1, 1, 1.0, "fingerprint_v2"),
+            )
+            cur.execute(
+                "INSERT INTO incidents (run_id, fingerprint, fingerprint_version, runtime,"
+                " error_type, normalized_message, occurrences, representative_trace,"
+                " project_locations_json, is_truncated)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (cur.lastrowid, "feedfacefeedface", "fingerprint_v2", "python",
+                 "ValueError", "from the future", 1, "trace", "[]", 0),
+            )
+        conn.close()
+
+        hist = query_historical_incidents(db_path)
+        assert hist, "v1 history must still be visible"
+        versions = {h["fingerprint_version"] for h in hist}
+        assert versions == {FINGERPRINT_VERSION}, f"version leak: {versions}"
+        assert not any(h["fingerprint"] == "feedfacefeedface" for h in hist)
+
+
+class TestPraEffect(unittest.TestCase):
+    """unittest bridge so `python -m unittest discover` runs the same suite."""
+
+    def test_message_normalization(self):
+        test_message_normalization()
+
+    def test_python_grouping_and_line_number_resilience(self):
+        test_python_grouping_and_line_number_resilience()
+
+    def test_node_grouping_and_vendor_exclusion(self):
+        test_node_grouping_and_vendor_exclusion()
+
+    def test_sqlite_and_html(self):
+        test_sqlite_and_html()
+
+    def test_multiline_collector(self):
+        test_multiline_collector()
+
+    def test_line_length_truncation_redos(self):
+        test_line_length_truncation_redos()
+
+    def test_interleaving_tolerance(self):
+        test_interleaving_tolerance()
+
+    def test_exit_codes(self):
+        test_exit_codes()
+
+    def test_chained_exception_single_root_incident(self):
+        test_chained_exception_single_root_incident()
+
+    def test_collector_stops_at_log_lines(self):
+        test_collector_stops_at_log_lines()
+
+    def test_scan_pattern_and_skip_policy(self):
+        test_scan_pattern_and_skip_policy()
+
+    def test_html_escapes_all_trace_fields(self):
+        test_html_escapes_all_trace_fields()
+
+    def test_fingerprint_version_isolation(self):
+        test_fingerprint_version_isolation()
+
+
 if __name__ == "__main__":
-    test_message_normalization()
-    test_python_grouping_and_line_number_resilience()
-    test_node_grouping_and_vendor_exclusion()
-    test_sqlite_and_html()
-    test_multiline_collector()
-    test_line_length_truncation_redos()
-    test_interleaving_tolerance()
-    test_exit_codes()
-    print("ALL TESTS PASSED.")
+    unittest.main(verbosity=2)
