@@ -1,17 +1,22 @@
-"""bench_memory.py - GATE-MEM-01 memory benchmark (TSK-011 / DEC-014).
+"""bench_memory.py - GATE-MEM-01 memory benchmark (TSK-011 / DEC-014 / TSK-013).
 
-Synthesizes a ~20 MB Python traceback log, runs the real parse+group pipeline
-in-process, and reports BOTH tracemalloc peak (Python allocations) and process
-Peak Working Set (RSS). Gate: peak RSS <= 50 MB on a 20 MB input.
+Two phases in separate processes so Peak RSS measures the streaming pipeline
+alone and never the fixture builder:
 
-Usage:
-    python bench_memory.py [target_mb]
-Exit: 0 = PASS, 1 = gate exceeded (evaluate streaming parser before v1.0), 2 = RSS unavailable (NOT_RUN)
+  python bench_memory.py [target_mb]   # parent: build temp log, spawn child, relay gate
+  python bench_memory.py --child FILE   # child: stream-parse FILE, report + gate
+
+The synthetic input generator is byte-identical to the pre-streaming baseline
+run (2026-10-24: tracemalloc 88.6 MB, Peak RSS 303.3 MB, 85.12s) so before/
+after numbers stay comparable. Gate: peak RSS <= 50 MB on a ~21 MB input.
+
+Exit: 0 = PASS, 1 = gate exceeded, 2 = RSS unavailable (NOT_RUN)
 """
 
 import ctypes
-import os
+import subprocess
 import sys
+import tempfile
 import time
 import tracemalloc
 from ctypes import wintypes
@@ -19,8 +24,6 @@ from pathlib import Path
 
 REPO_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(REPO_DIR))
-
-from pra_effect import TracebackParser, group_traces  # noqa: E402
 
 GATE_MB = 50
 
@@ -64,13 +67,12 @@ def peak_rss_bytes():
         wintypes.DWORD,
     ]
     psapi.GetProcessMemoryInfo.restype = wintypes.BOOL
-    ok = psapi.GetProcessMemoryInfo(
-        handle, ctypes.byref(counters), counters.cb
-    )
+    ok = psapi.GetProcessMemoryInfo(handle, ctypes.byref(counters), counters.cb)
     return counters.PeakWorkingSetSize if ok else None
 
 
 def build_log(target_mb: float) -> str:
+    """Byte-identical to the pre-streaming baseline generator."""
     block = BLOCK.format(n=1, l=42, l2=17)
     repeats = int((target_mb * 1024 * 1024) // len(block)) + 1
     # Vary ids per block so grouping work is representative (not one giant duplicate)
@@ -80,42 +82,74 @@ def build_log(target_mb: float) -> str:
     return "".join(parts)
 
 
-def main() -> int:
-    target_mb = float(sys.argv[1]) if len(sys.argv) > 1 else 20.0
-    print(f"Pra-Effect GATE-MEM-01: target input {target_mb:.0f} MB, gate <={GATE_MB} MB peak RSS")
+def run_child(path: Path) -> int:
+    """Parse phase: the exact streaming pipeline the CLI uses (scan <file>)."""
+    from pra_effect import iter_scan_lines, stream_analyze
 
-    text = build_log(target_mb)
-    actual_mb = len(text) / (1024 * 1024)
-    print(f"Synthetic log built: {actual_mb:.1f} MB, {text.count('Traceback'):,} tracebacks")
-
-    rss_before = peak_rss_bytes()
+    rss_start = peak_rss_bytes()
     tracemalloc.start()
     t0 = time.perf_counter()
-    traces = TracebackParser(cwd=REPO_DIR).parse_all(text)
-    groups = group_traces(traces)
+    total_lines, total_exceptions, groups = stream_analyze(
+        iter_scan_lines(path, "*.log"), REPO_DIR, None, None
+    )
     elapsed = time.perf_counter() - t0
     py_peak, _ = tracemalloc.get_traced_memory()
     tracemalloc.stop()
     rss_peak = peak_rss_bytes()
 
-    print(f"Parse+group: {elapsed:.2f}s, {len(traces):,} traces, {len(groups):,} groups")
+    print(
+        f"Parse+group (streaming): {elapsed:.2f}s, {total_lines:,} lines, "
+        f"{total_exceptions:,} traces, {len(groups):,} groups"
+    )
     print(f"tracemalloc peak: {py_peak / 1024 / 1024:.1f} MB (Python allocations only)")
     if rss_peak is None:
         print("Peak RSS: NOT_RUN (platform API unavailable) — gate not evaluated")
         return 2
     print(
         f"Peak RSS: {rss_peak / 1024 / 1024:.1f} MB "
-        f"(before parse: {(rss_before or 0) / 1024 / 1024:.1f} MB)"
+        f"(at parse start: {(rss_start or 0) / 1024 / 1024:.1f} MB)"
     )
 
     if rss_peak <= GATE_MB * 1024 * 1024:
         print(f"GATE-MEM-01: PASS (<= {GATE_MB} MB)")
         return 0
-    print(
-        f"GATE-MEM-01: FAIL ({rss_peak / 1024 / 1024:.1f} MB > {GATE_MB} MB) — "
-        "evaluate incremental streaming parser before finalizing v1.0 design"
-    )
+    print(f"GATE-MEM-01: FAIL ({rss_peak / 1024 / 1024:.1f} MB > {GATE_MB} MB)")
     return 1
+
+
+def main() -> int:
+    if len(sys.argv) >= 3 and sys.argv[1] == "--child":
+        return run_child(Path(sys.argv[2]))
+
+    target_mb = float(sys.argv[1]) if len(sys.argv) > 1 else 20.0
+    print(
+        f"Pra-Effect GATE-MEM-01: target input {target_mb:.0f} MB, "
+        f"gate <={GATE_MB} MB peak RSS"
+    )
+
+    text = build_log(target_mb)
+    actual_mb = len(text) / (1024 * 1024)
+    n_tb = text.count("Traceback")
+    print(f"Synthetic log built: {actual_mb:.1f} MB, {n_tb:,} tracebacks")
+
+    with tempfile.NamedTemporaryFile(
+        "w", suffix=".log", delete=False, encoding="utf-8", dir=str(REPO_DIR)
+    ) as tf:
+        tf.write(text)
+        tmp_path = Path(tf.name)
+    try:
+        proc = subprocess.run(
+            [sys.executable, str(Path(__file__).resolve()), "--child", str(tmp_path)],
+            text=True,
+            capture_output=True,
+            cwd=str(REPO_DIR),
+        )
+        sys.stdout.write(proc.stdout)
+        if proc.stderr.strip():
+            sys.stderr.write(proc.stderr)
+        return proc.returncode
+    finally:
+        tmp_path.unlink(missing_ok=True)
 
 
 if __name__ == "__main__":

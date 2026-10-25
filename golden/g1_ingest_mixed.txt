@@ -1,0 +1,43 @@
+Pra-Effect — Analysis Complete
+Lines scanned:        36
+Exceptions found:     6
+Unique incident groups:4
+Actionable Comp Ratio:1.50x
+Duration:             <TIME>
+
+TOP INCIDENTS
+============================================================
+#1 [PYTHON] ValueError (4d8881ba5cd845a1)
+    Occurrences: 2 | /app/src/utils.py:12
+    Message:     invalid item <ID> for request-id: <UUID>
+    Sample stack excerpt:
+      File "/app/src/utils.py", line 12, in process
+      raise ValueError("invalid item 9812 for request-id: 123e4567-e89b-12d3-a456-426614174000")
+      ValueError: invalid item 9812 for request-id: 123e4567-e89b-12d3-a456-426614174000
+------------------------------------------------------------
+#2 [NODE] Error (d0db219f14e9cf6b)
+    Occurrences: 2 | /app/node_modules/express/lib/router/layer.js:95
+    Message:     Failed to fetch user <ID>
+    Sample stack excerpt:
+      at fetchUser (/app/src/api.js:42:15)
+      at handleRequest (/app/src/server.js:88:9)
+      at Layer.handle [as handle_request] (/app/node_modules/express/lib/router/layer.js:95:5)
+------------------------------------------------------------
+#3 [PYTHON] PermissionError (c9d6b4a6921331a4)
+    Occurrences: 1 | /app/src/auth.py:45
+    Message:     token expired at <HEX>
+    Sample stack excerpt:
+      File "/app/src/auth.py", line 45, in verify
+      raise PermissionError("token expired at 0x7fff5fbff8a0")
+      PermissionError: token expired at 0x7fff5fbff8a0
+------------------------------------------------------------
+#4 [NODE] TypeError (50268a9de553826c)
+    Occurrences: 1 | internal/process/task_queues.js:95
+    Message:     Cannot read properties of undefined (reading 'token')
+    Sample stack excerpt:
+      TypeError: Cannot read properties of undefined (reading 'token')
+      at authMiddleware (/app/src/auth.js:20:10)
+      at processTicksAndRejections (internal/process/task_queues.js:95:5)
+------------------------------------------------------------
+
+NOTE: fingerprint normalization (UUID/hex/ID) is NOT PII redaction — tokens, emails, or secrets inside log messages are shown as-is.

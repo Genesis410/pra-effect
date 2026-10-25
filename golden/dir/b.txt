@@ -1,0 +1,14 @@
+
+Error: Failed to fetch user 12345
+    at fetchUser (/app/src/api.js:42:15)
+    at handleRequest (/app/src/server.js:88:9)
+    at Layer.handle [as handle_request] (/app/node_modules/express/lib/router/layer.js:95:5)
+
+Error: Failed to fetch user 67890
+    at fetchUser (/app/src/api.js:50:15)
+    at handleRequest (/app/src/server.js:88:9)
+    at Layer.handle [as handle_request] (/app/node_modules/express/lib/router/layer.js:95:5)
+
+TypeError: Cannot read properties of undefined (reading 'token')
+    at authMiddleware (/app/src/auth.js:20:10)
+    at processTicksAndRejections (internal/process/task_queues.js:95:5)

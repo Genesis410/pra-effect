@@ -1,0 +1,22 @@
+
+INFO 2026-10-24 10:00:01 Starting service
+Traceback (most recent call last):
+  File "/app/src/parser.py", line 81, in parse_item
+    val = process(item)
+  File "/app/src/utils.py", line 12, in process
+    raise ValueError("invalid item 9812 for request-id: 123e4567-e89b-12d3-a456-426614174000")
+ValueError: invalid item 9812 for request-id: 123e4567-e89b-12d3-a456-426614174000
+
+INFO 2026-10-24 10:00:02 Handling next
+Traceback (most recent call last):
+  File "/app/src/parser.py", line 106, in parse_item
+    val = process(item)
+  File "/app/src/utils.py", line 12, in process
+    raise ValueError("invalid item 4173 for request-id: 987e6543-e21b-12d3-a456-426614174111")
+ValueError: invalid item 4173 for request-id: 987e6543-e21b-12d3-a456-426614174111
+
+INFO 2026-10-24 10:00:03 Critical failure
+Traceback (most recent call last):
+  File "/app/src/auth.py", line 45, in verify
+    raise PermissionError("token expired at 0x7fff5fbff8a0")
+PermissionError: token expired at 0x7fff5fbff8a0

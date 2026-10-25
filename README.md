@@ -18,6 +18,7 @@
   - Interleaving tolerance up to 2 lines of interleaved non-trace log noise.
   - Bounded message collection: log lines (`INFO ...`, timestamps) never leak into an error message.
   - Chained Python exceptions collapse to a single root incident (causes kept as diagnostic context, never split the fingerprint).
+- **Streaming Architecture:** input is parsed line-by-line through state machines — memory scales with the number of *unique incidents*, not input size (21 MB log parses with a flat pipeline footprint). Optional `--max-input-mb` backstop rejects oversized input (0 disables).
 - **Local Persistence & Export:**
   - WAL-mode SQLite storage for thread-safe concurrent writes and query performance.
   - Self-contained, single-file HTML reports with zero external CDN assets.
@@ -69,6 +70,9 @@ pra-effect scan /var/log --pattern "*.log,*.txt,*.out"
 
 # Files that cannot be read (binary/unreadable) are skipped with a warning on stderr.
 # Exit 1 if zero readable files matched — never a silent "0 errors found".
+
+# Input-size backstop (default 100 MB, streaming already bounds the pipeline; 0 disables)
+pra-effect scan /var/log/huge --max-input-mb 250
 ```
 
 ### 3. Historical Incident Aggregation

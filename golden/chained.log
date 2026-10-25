@@ -1,0 +1,13 @@
+Traceback (most recent call last):
+  File "/app/src/db.py", line 12, in query
+    raise KeyError("user 42")
+KeyError: user 42
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/app/src/api.py", line 55, in get_profile
+    data = query(uid)
+  File "/app/src/db.py", line 12, in query
+    raise KeyError("user 42")
+KeyError: failed to load profile

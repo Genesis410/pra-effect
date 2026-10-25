@@ -1,0 +1,19 @@
+Pra-Effect — Analysis Complete
+Lines scanned:        13
+Exceptions found:     1
+Unique incident groups:1
+Actionable Comp Ratio:1.00x
+Duration:             <TIME>
+
+TOP INCIDENTS
+============================================================
+#1 [PYTHON] KeyError (eb29fa67e26221c2)
+    Occurrences: 1 | /app/src/db.py:12
+    Message:     failed to load profile
+    Sample stack excerpt:
+      File "/app/src/db.py", line 12, in query
+      raise KeyError("user 42")
+      KeyError: failed to load profile
+------------------------------------------------------------
+
+NOTE: fingerprint normalization (UUID/hex/ID) is NOT PII redaction — tokens, emails, or secrets inside log messages are shown as-is.

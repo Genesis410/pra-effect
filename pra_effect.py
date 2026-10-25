@@ -7,21 +7,35 @@ from __future__ import annotations
 import argparse
 import hashlib
 import html
+import io
 import json
 import os
 import re
 import sqlite3
 import sys
 import time
+from collections import deque
 from dataclasses import asdict, dataclass, field
 from functools import lru_cache
 from pathlib import Path
-from typing import Iterable, List, Optional, Sequence, Tuple
+from typing import Iterable, Iterator, List, Optional, Sequence, Tuple
 
 FINGERPRINT_VERSION = "fingerprint_v1"
 MAX_LINE_LENGTH = 4096
 MAX_CONTINUATION_LINES = 5
 MAX_INTERLEAVED_LINES = 2
+# DEC-016: input-size backstop, defense-in-depth alongside streaming (not a
+# substitute for it). Default proven by bench_memory.py runs recorded in
+# .confidential/TASKS.md (TSK-014). 0 disables the cap.
+DEFAULT_MAX_INPUT_MB = 100.0
+
+
+class InputTooLargeError(Exception):
+    """Input exceeded --max-input-mb."""
+
+
+class ScanInputError(Exception):
+    """Fatal scan/ingest source error; message is already user-facing."""
 
 # Normalization patterns
 RE_UUID = re.compile(
@@ -168,245 +182,349 @@ def normalize_frame_path(raw_path: str, cwd: Path, src_override: Optional[Path] 
         return clean, False
 
 
-class TracebackParser:
-    def __init__(self, cwd: Optional[Path] = None, src_dir: Optional[Path] = None):
-        self.cwd = cwd or Path.cwd()
+# --- Streaming core (DEC-015): line-fed state machines -----------------------
+# Single source of truth for parse rules; parse_python_traces / parse_node_traces
+# are thin wrappers over these so every consumer (tests, CLI, bench) sees the
+# exact same behavior.
+
+
+def _collect_stream(sm, lines: Iterable[str]) -> List[ParsedTrace]:
+    out: List[ParsedTrace] = []
+    for raw in lines:
+        if len(raw) > MAX_LINE_LENGTH:
+            out.extend(sm.feed(raw[:MAX_LINE_LENGTH], True))
+        else:
+            out.extend(sm.feed(raw, False))
+    out.extend(sm.finish())
+    return out
+
+
+class PythonTraceStream:
+    """Line-fed Python traceback parser.
+
+    Faithful port of the index-based parser: ReDoS pre-truncation, bounded
+    5-line message collector with log-line/timestamp/chain-marker boundary,
+    2-line interleaving window with rewind-to-header+1, and chained-exception
+    handling where the OUTER exception owns the incident (DEC-011): the most
+    recently completed traceback is held; a chain marker parks it; the next
+    completed traceback absorbs parked causes into raw_text only (never into
+    the fingerprint payload).
+
+    Bounded divergence (documented in DEC-015): a chain marker with no held
+    traceback is ignored instead of popping an earlier already-folded trace.
+    CPython always prints a marker directly after its cause traceback, so
+    real logs are unaffected; only malformed double-marker sequences differ,
+    and only in cause-context retention.
+    """
+
+    def __init__(self, cwd: Path, src_dir: Optional[Path] = None):
+        self.cwd = cwd
         self.src_dir = src_dir
+        self.pend: "deque[Tuple[str, bool]]" = deque()
+        self.held: Optional[ParsedTrace] = None
+        self.parked: List[Tuple[ParsedTrace, str]] = []
+        self._reset_candidate()
 
-    def parse_python_traces(self, text: str) -> List[ParsedTrace]:
-        traces: List[ParsedTrace] = []
-        raw_lines = text.splitlines()
-        lines: List[str] = []
-        lines_truncated: List[bool] = []
-        for l in raw_lines:
-            if len(l) > MAX_LINE_LENGTH:
-                lines.append(l[:MAX_LINE_LENGTH])
-                lines_truncated.append(True)
+    def _reset_candidate(self) -> None:
+        self.mode = "idle"  # idle | frame | collect
+        self.frames: List[StackFrame] = []
+        self.trace_lines: List[Tuple[str, bool]] = []
+        self.trunc_any = False
+        self.interleaved = 0
+        self.await_source = False
+        self.err_type = ""
+        self.raw_msg = ""
+        self.extra: List[str] = []
+        self.collected = 0
+
+    def feed(self, line: str, truncated: bool) -> List[ParsedTrace]:
+        self.pend.append((line, truncated))
+        return self._drain()
+
+    def finish(self) -> List[ParsedTrace]:
+        out = self._drain()
+        if self.mode == "collect":
+            # Input ends inside the message collector: the original assembles
+            # the trace right there.
+            out.extend(self._complete())
+            self._reset_candidate()
+        elif self.mode == "frame":
+            # Candidate never reached an exception line: dropped, as before.
+            self._reset_candidate()
+        if self.held is not None:
+            out.append(self.held)
+            self.held = None
+        for cause, _marker in self.parked:
+            out.append(cause)
+        self.parked = []
+        return out
+
+    def _drain(self) -> List[ParsedTrace]:
+        out: List[ParsedTrace] = []
+        stall = 0
+        while self.pend:
+            line, truncated = self.pend[0]
+            if self._step(line, truncated, out):
+                self.pend.popleft()
+                stall = 0
             else:
-                lines.append(l)
-                lines_truncated.append(False)
+                stall += 1
+                if stall > 10_000:
+                    raise RuntimeError("PythonTraceStream made no progress")
+        return out
 
-        i = 0
-        n = len(lines)
-        # DEC-011: cause tracebacks parked until their outer root traceback appears
-        pending_causes: List[Tuple[ParsedTrace, str]] = []
+    def _step(self, line: str, truncated: bool, out: List[ParsedTrace]) -> bool:
+        stripped = line.strip()
 
-        while i < n:
-            line = lines[i]
-            if RE_PY_TRACE_START.match(line.strip()):
-                start_idx = i
-                frames: List[StackFrame] = []
-                trace_lines: List[str] = [lines[i]]
-                interleaved_count = 0
-                i += 1
-                while i < n:
-                    frame_match = RE_PY_FRAME.match(lines[i])
-                    if frame_match:
-                        interleaved_count = 0
-                        trace_lines.append(lines[i])
-                        raw_fpath, line_no, func_name = frame_match.groups()
-                        norm_p, in_proj = normalize_frame_path(
-                            raw_fpath, self.cwd, self.src_dir
-                        )
-                        frames.append(
-                            StackFrame(
-                                filepath=raw_fpath,
-                                line_number=int(line_no),
-                                function_name=func_name,
-                                is_in_project=in_proj,
-                                normalized_path=norm_p,
-                            )
-                        )
-                        i += 1
-                        # Indented source code line
-                        if i < n and lines[i].startswith("    ") and not RE_PY_FRAME.match(lines[i]):
-                            trace_lines.append(lines[i])
-                            i += 1
-                        continue
+        if self.mode == "idle":
+            if RE_PY_TRACE_START.match(stripped):
+                self.mode = "frame"
+                self.frames = []
+                self.trace_lines = [(line, truncated)]
+                self.trunc_any = truncated
+                self.interleaved = 0
+                self.await_source = False
+                return True
+            if RE_CHAIN_MARKER.match(stripped) and self.held is not None:
+                self.parked.append((self.held, stripped))
+                self.held = None
+            return True
 
-                    err_match = RE_PY_ERROR.match(lines[i].strip())
-                    if err_match:
-                        err_type = err_match.group(1)
-                        raw_msg = err_match.group(2) or ""
-                        trace_lines.append(lines[i])
-                        i += 1
-                        # Bounded multi-line collector (max 5 additional lines)
-                        extra_lines = []
-                        collected = 0
-                        while (
-                            i < n
-                            and collected < MAX_CONTINUATION_LINES
-                            and lines[i].strip()
-                            and not RE_PY_TRACE_START.match(lines[i].strip())
-                            and not RE_PY_FRAME.match(lines[i])
-                            and not RE_PY_ERROR.match(lines[i].strip())
-                            and not RE_NODE_ERROR_HEADER.match(lines[i].strip())
-                            and not RE_CHAIN_MARKER.match(lines[i].strip())
-                            and not RE_LOG_LEVEL_LINE.match(lines[i].strip())
-                            and not RE_TIMESTAMP_LINE.match(lines[i].strip())
-                        ):
-                            extra_lines.append(lines[i].strip())
-                            trace_lines.append(lines[i])
-                            collected += 1
-                            i += 1
+        if self.mode == "frame":
+            if self.await_source:
+                if line.startswith("    ") and not RE_PY_FRAME.match(line):
+                    self.trace_lines.append((line, truncated))
+                    self.trunc_any = truncated
+                    self.await_source = False
+                    return True
+                self.await_source = False
 
-                        if extra_lines:
-                            raw_msg = (
-                                raw_msg + " " + " ".join(extra_lines)
-                                if raw_msg
-                                else " ".join(extra_lines)
-                            )
-
-                        end_idx = i
-                        raw_block = "\n".join(trace_lines)
-                        if pending_causes:
-                            # DEC-011: outermost exception owns the incident; causes ride along
-                            # as diagnostic context only (never enter the fingerprint payload).
-                            parts: List[str] = []
-                            for cause_trace, marker_line in pending_causes:
-                                parts.append(cause_trace.raw_text)
-                                parts.append(marker_line)
-                            parts.append(raw_block)
-                            raw_block = "\n".join(parts)
-                            pending_causes = []
-                        norm_msg, is_trunc = normalize_message(raw_msg)
-                        any_trunc = is_trunc or any(lines_truncated[start_idx:end_idx])
-                        trace = ParsedTrace(
-                            runtime="python",
-                            error_type=err_type,
-                            original_message=raw_msg,
-                            normalized_message=norm_msg,
-                            frames=frames,
-                            raw_text=raw_block,
-                            is_truncated=any_trunc,
-                        )
-                        trace.fingerprint = trace.compute_fingerprint()
-                        traces.append(trace)
-                        break
-
-                    # Check for new trace start or node header -> abort candidate
-                    if RE_PY_TRACE_START.match(lines[i].strip()) or RE_NODE_ERROR_HEADER.match(lines[i].strip()):
-                        break
-
-                    # Interleaving tolerance (Decision 1B: max 2 lines)
-                    if interleaved_count < MAX_INTERLEAVED_LINES:
-                        interleaved_count += 1
-                        i += 1
-                        continue
-                    else:
-                        # Exceeded tolerance, rewind to start_idx + 1 so outer loop can scan
-                        i = start_idx + 1
-                        break
-            else:
-                stripped = line.strip()
-                if RE_CHAIN_MARKER.match(stripped) and traces:
-                    # This completed traceback is a cause; hold it for the next (outer) traceback.
-                    pending_causes.append((traces.pop(), stripped))
-                i += 1
-
-        # Log truncated mid-chain: keep parked causes as standalone traces instead of dropping them
-        for cause_trace, _marker in pending_causes:
-            traces.append(cause_trace)
-        return traces
-
-    def parse_node_traces(self, text: str) -> List[ParsedTrace]:
-        traces: List[ParsedTrace] = []
-        raw_lines = text.splitlines()
-        lines: List[str] = []
-        lines_truncated: List[bool] = []
-        for l in raw_lines:
-            if len(l) > MAX_LINE_LENGTH:
-                lines.append(l[:MAX_LINE_LENGTH])
-                lines_truncated.append(True)
-            else:
-                lines.append(l)
-                lines_truncated.append(False)
-
-        i = 0
-        n = len(lines)
-
-        while i < n:
-            line_str = lines[i].strip()
-            header_match = RE_NODE_ERROR_HEADER.match(line_str)
-            if header_match:
-                # Look ahead to see if the next non-empty line starts with 'at '
-                peek = i + 1
-                while peek < n and not lines[peek].strip():
-                    peek += 1
-                if peek < n and lines[peek].strip().startswith("at "):
-                    err_type = header_match.group(1)
-                    raw_msg = header_match.group(2) or ""
-                    start_idx = i
-                    frames: List[StackFrame] = []
-                    trace_lines: List[str] = [lines[i]]
-                    interleaved_count = 0
-                    i = peek
-
-                    while i < n:
-                        line_cur = lines[i].strip()
-                        if not line_cur:
-                            i += 1
-                            continue
-
-                        f_match = RE_NODE_FRAME.match(line_cur)
-                        if f_match:
-                            interleaved_count = 0
-                            trace_lines.append(lines[i])
-                            fn_name, raw_fpath, line_no, _ = f_match.groups()
-                            fn_name = fn_name or "<anonymous>"
-                            norm_p, in_proj = normalize_frame_path(
-                                raw_fpath, self.cwd, self.src_dir
-                            )
-                            frames.append(
-                                StackFrame(
-                                    filepath=raw_fpath,
-                                    line_number=int(line_no),
-                                    function_name=fn_name,
-                                    is_in_project=in_proj,
-                                    normalized_path=norm_p,
-                                )
-                            )
-                            i += 1
-                            continue
-
-                        # Check if another trace header begins
-                        if RE_NODE_ERROR_HEADER.match(line_cur) or RE_PY_TRACE_START.match(line_cur):
-                            break
-
-                        # Interleaving tolerance (Decision 1B: max 2 lines non-trace)
-                        if interleaved_count < MAX_INTERLEAVED_LINES:
-                            interleaved_count += 1
-                            i += 1
-                            continue
-                        else:
-                            break
-
-                    raw_block = "\n".join(trace_lines)
-                    norm_msg, is_trunc = normalize_message(raw_msg)
-                    any_trunc = is_trunc or any(lines_truncated[start_idx:i])
-                    trace = ParsedTrace(
-                        runtime="node",
-                        error_type=err_type,
-                        original_message=raw_msg,
-                        normalized_message=norm_msg,
-                        frames=frames,
-                        raw_text=raw_block,
-                        is_truncated=any_trunc,
+            frame_match = RE_PY_FRAME.match(line)
+            if frame_match:
+                raw_fpath, line_no, func_name = frame_match.groups()
+                norm_p, in_proj = normalize_frame_path(
+                    raw_fpath, self.cwd, self.src_dir
+                )
+                self.frames.append(
+                    StackFrame(
+                        filepath=raw_fpath,
+                        line_number=int(line_no),
+                        function_name=func_name,
+                        is_in_project=in_proj,
+                        normalized_path=norm_p,
                     )
-                    trace.fingerprint = trace.compute_fingerprint()
-                    traces.append(trace)
-                    continue
-            i += 1
-        return traces
+                )
+                self.trace_lines.append((line, truncated))
+                self.trunc_any = self.trunc_any or truncated
+                self.interleaved = 0
+                self.await_source = True
+                return True
 
-    def parse_all(self, text: str) -> List[ParsedTrace]:
-        py_traces = self.parse_python_traces(text)
-        node_traces = self.parse_node_traces(text)
-        return py_traces + node_traces
+            err_match = RE_PY_ERROR.match(stripped)
+            if err_match:
+                self.err_type = err_match.group(1)
+                self.raw_msg = err_match.group(2) or ""
+                self.trace_lines.append((line, truncated))
+                self.trunc_any = self.trunc_any or truncated
+                self.mode = "collect"
+                self.extra = []
+                self.collected = 0
+                return True
+
+            if RE_PY_TRACE_START.match(stripped) or RE_NODE_ERROR_HEADER.match(stripped):
+                # New header before any exception line: abandon candidate and
+                # re-dispatch this line under idle rules.
+                self._reset_candidate()
+                return False
+
+            if self.interleaved < MAX_INTERLEAVED_LINES:
+                self.interleaved += 1
+                return True  # interleaved noise: consumed, not part of trace
+
+            # Decision 1B rewind: re-scan everything after the header.
+            rest = list(self.pend)[1:]
+            self.pend = deque(self.trace_lines[1:] + [(line, truncated)] + rest)
+            self._reset_candidate()
+            return False
+
+        # mode == "collect"
+        stop = (
+            self.collected >= MAX_CONTINUATION_LINES
+            or not stripped
+            or RE_PY_TRACE_START.match(stripped)
+            or RE_PY_FRAME.match(line)
+            or RE_PY_ERROR.match(stripped)
+            or RE_NODE_ERROR_HEADER.match(stripped)
+            or RE_CHAIN_MARKER.match(stripped)
+            or RE_LOG_LEVEL_LINE.match(stripped)
+            or RE_TIMESTAMP_LINE.match(stripped)
+        )
+        if stop:
+            out.extend(self._complete())
+            self._reset_candidate()
+            return False  # the stopping line is re-dispatched in idle
+        self.extra.append(stripped)
+        self.trace_lines.append((line, truncated))
+        self.trunc_any = self.trunc_any or truncated
+        self.collected += 1
+        return True
+
+    def _complete(self) -> List[ParsedTrace]:
+        raw_block = "\n".join(l for l, _ in self.trace_lines)
+        if self.parked:
+            # DEC-011: causes ride along in the rendered trace only.
+            parts: List[str] = []
+            for cause, marker in self.parked:
+                parts.append(cause.raw_text)
+                parts.append(marker)
+            parts.append(raw_block)
+            raw_block = "\n".join(parts)
+            self.parked = []
+        raw_msg = self.raw_msg
+        if self.extra:
+            raw_msg = (
+                raw_msg + " " + " ".join(self.extra) if raw_msg else " ".join(self.extra)
+            )
+        norm_msg, is_trunc = normalize_message(raw_msg)
+        trace = ParsedTrace(
+            runtime="python",
+            error_type=self.err_type,
+            original_message=raw_msg,
+            normalized_message=norm_msg,
+            frames=self.frames,
+            raw_text=raw_block,
+            is_truncated=is_trunc or self.trunc_any,
+        )
+        trace.fingerprint = trace.compute_fingerprint()
+        emitted: List[ParsedTrace] = []
+        if self.held is not None:
+            emitted.append(self.held)  # released: no marker followed it
+        self.held = trace
+        return emitted
 
 
-def group_traces(traces: Iterable[ParsedTrace]) -> List[IncidentGroup]:
-    groups: dict[str, IncidentGroup] = {}
+class NodeTraceStream:
+    """Line-fed Node.js V8 stack parser (no chaining in V8 output)."""
+
+    def __init__(self, cwd: Path, src_dir: Optional[Path] = None):
+        self.cwd = cwd
+        self.src_dir = src_dir
+        self.pend: "deque[Tuple[str, bool]]" = deque()
+        self._reset()
+
+    def _reset(self) -> None:
+        self.mode = "idle"  # idle | await | frames
+        self.frames: List[StackFrame] = []
+        self.trace_lines: List[Tuple[str, bool]] = []
+        self.trunc_any = False
+        self.interleaved = 0
+        self.err_type = ""
+        self.raw_msg = ""
+
+    def feed(self, line: str, truncated: bool) -> List[ParsedTrace]:
+        self.pend.append((line, truncated))
+        return self._drain()
+
+    def finish(self) -> List[ParsedTrace]:
+        out = self._drain()
+        if self.mode == "frames":
+            out.append(self._make_trace())
+        # mode "await": header with no `at ` frame — dropped, as before.
+        self._reset()
+        return out
+
+    def _drain(self) -> List[ParsedTrace]:
+        out: List[ParsedTrace] = []
+        stall = 0
+        while self.pend:
+            line, truncated = self.pend[0]
+            if self._step(line, truncated, out):
+                self.pend.popleft()
+                stall = 0
+            else:
+                stall += 1
+                if stall > 10_000:
+                    raise RuntimeError("NodeTraceStream made no progress")
+        return out
+
+    def _step(self, line: str, truncated: bool, out: List[ParsedTrace]) -> bool:
+        stripped = line.strip()
+
+        if self.mode == "idle":
+            header = RE_NODE_ERROR_HEADER.match(stripped)
+            if header:
+                self.err_type = header.group(1)
+                self.raw_msg = header.group(2) or ""
+                self.mode = "await"
+                self.frames = []
+                self.trace_lines = [(line, truncated)]
+                self.trunc_any = truncated
+                self.interleaved = 0
+                return True
+            return True  # non-header noise
+
+        if self.mode == "await":
+            if not stripped:
+                return True  # blank between header and first frame
+            if stripped.startswith("at "):
+                self.mode = "frames"
+                return False  # re-dispatch under frame rules
+            self._reset()  # header without frames: drop header
+            return False  # re-dispatch this line under idle rules
+
+        # mode == "frames"
+        if not stripped:
+            return True  # blank inside stack: consumed, never in raw_text
+        frame_match = RE_NODE_FRAME.match(stripped)
+        if frame_match:
+            fn_name, raw_fpath, line_no, _col = frame_match.groups()
+            fn_name = fn_name or "<anonymous>"
+            norm_p, in_proj = normalize_frame_path(raw_fpath, self.cwd, self.src_dir)
+            self.frames.append(
+                StackFrame(
+                    filepath=raw_fpath,
+                    line_number=int(line_no),
+                    function_name=fn_name,
+                    is_in_project=in_proj,
+                    normalized_path=norm_p,
+                )
+            )
+            self.trace_lines.append((line, truncated))
+            self.trunc_any = self.trunc_any or truncated
+            self.interleaved = 0
+            return True
+
+        if RE_NODE_ERROR_HEADER.match(stripped) or RE_PY_TRACE_START.match(stripped):
+            out.append(self._make_trace())
+            self._reset()
+            return False  # new header re-dispatched in idle
+
+        if self.interleaved < MAX_INTERLEAVED_LINES:
+            self.interleaved += 1
+            return True  # interleaved noise: consumed, not in raw_text
+
+        out.append(self._make_trace())
+        self._reset()
+        return False  # the overflowing line re-dispatched in idle
+
+    def _make_trace(self) -> ParsedTrace:
+        raw_block = "\n".join(l for l, _ in self.trace_lines)
+        norm_msg, is_trunc = normalize_message(self.raw_msg)
+        trace = ParsedTrace(
+            runtime="node",
+            error_type=self.err_type,
+            original_message=self.raw_msg,
+            normalized_message=norm_msg,
+            frames=self.frames,
+            raw_text=raw_block,
+            is_truncated=is_trunc or self.trunc_any,
+        )
+        trace.fingerprint = trace.compute_fingerprint()
+        return trace
+
+
+def fold_traces(traces: Iterable[ParsedTrace], groups: "dict[str, IncidentGroup]") -> None:
+    """Incrementally fold traces into a fingerprint->IncidentGroup bucket."""
     for t in traces:
         if t.fingerprint not in groups:
             locations = []
@@ -430,6 +548,186 @@ def group_traces(traces: Iterable[ParsedTrace]) -> List[IncidentGroup]:
             g.occurrences += 1
             if t.is_truncated:
                 g.is_truncated = True
+
+
+def iter_pairs(lines: Iterable[str], max_bytes: Optional[int] = None) -> Iterator[Tuple[str, bool]]:
+    """Truncate-to-4096 pre-check (ReDoS guard) plus --max-input-mb backstop."""
+    used = 0
+    for raw in lines:
+        if max_bytes is not None:
+            used += len(raw.encode("utf-8", "replace")) + 1
+            if used > max_bytes:
+                raise InputTooLargeError(
+                    f"Error: input exceeds --max-input-mb limit "
+                    f"({max_bytes // (1024 * 1024)} MB); raise the limit or split the input"
+                )
+        if len(raw) > MAX_LINE_LENGTH:
+            yield raw[:MAX_LINE_LENGTH], True
+        else:
+            yield raw, False
+
+
+def stream_analyze(
+    lines: Iterable[str],
+    cwd: Path,
+    src_dir: Optional[Path] = None,
+    max_bytes: Optional[int] = None,
+) -> Tuple[int, int, List[IncidentGroup]]:
+    """Single-pass streaming analysis: (total_lines, total_exceptions, groups).
+
+    Both machines see every line; folds stay separate so the merged bucket
+    preserves python-insertion-then-node-insertion order — byte-identical to
+    the former two-pass parse_all() + single group_traces() call.
+    """
+    py = PythonTraceStream(cwd, src_dir)
+    node = NodeTraceStream(cwd, src_dir)
+    fpy: "dict[str, IncidentGroup]" = {}
+    fnode: "dict[str, IncidentGroup]" = {}
+    total_lines = 0
+    total_exceptions = 0
+    for line, truncated in iter_pairs(lines, max_bytes):
+        total_lines += 1
+        tl = py.feed(line, truncated)
+        fold_traces(tl, fpy)
+        total_exceptions += len(tl)
+        nl = node.feed(line, truncated)
+        fold_traces(nl, fnode)
+        total_exceptions += len(nl)
+    fl = py.finish()
+    fold_traces(fl, fpy)
+    total_exceptions += len(fl)
+    nl2 = node.finish()
+    fold_traces(nl2, fnode)
+    total_exceptions += len(nl2)
+
+    merged = {**fpy, **fnode}
+    groups = sorted(merged.values(), key=lambda g: g.occurrences, reverse=True)
+    return total_lines, total_exceptions, groups
+
+
+def iter_stdin_lines() -> Iterator[str]:
+    for line in sys.stdin:
+        if line.endswith("\n"):
+            line = line[:-1]
+        if line.endswith("\r"):
+            line = line[:-1]
+        yield line
+
+
+def _probe_binary(path: Path) -> io.BufferedReader:
+    """Open and NUL-probe a file. Raises OSError with a user-facing reason."""
+    try:
+        fb = open(path, "rb")
+    except OSError as e:
+        raise OSError(e.strerror or str(e))
+    try:
+        head = fb.read(8192)
+    except OSError as e:
+        fb.close()
+        raise OSError(e.strerror or str(e))
+    if b"\x00" in head:
+        fb.close()
+        raise OSError("binary content (NUL byte)")
+    fb.seek(0)
+    return fb
+
+
+def _stream_file(fb: io.BufferedReader, state: dict) -> Iterator[str]:
+    """Decode one probed binary handle into terminator-stripped text lines.
+
+    `state` records whether any line was seen and whether the last raw line
+    ended with a newline — the inputs needed to reproduce the legacy
+    '\\n'.join() line count between files exactly.
+    """
+    state["any"] = False
+    state["ends_nl"] = False
+    try:
+        with io.TextIOWrapper(fb, encoding="utf-8", errors="replace", newline=None) as tw:
+            for raw in tw:
+                state["any"] = True
+                state["ends_nl"] = raw.endswith("\n")
+                if raw.endswith("\n"):
+                    raw = raw[:-1]
+                if raw.endswith("\r"):
+                    raw = raw[:-1]
+                yield raw
+    except OSError as e:
+        # Mid-file I/O failure: treat as a skip (legacy read-whole-file would
+        # have failed the probe instead; this path is disk-error rare).
+        sys.stderr.write(f"[Pra-Effect] skipped partial read: {e}\n")
+    finally:
+        fb.close()
+
+
+def iter_scan_lines(target: Path, pattern: str) -> Iterator[str]:
+    """Stream an explicit file or a globbed directory (DEC-012 + DEC-015).
+
+    Preserves legacy semantics: glob order (pattern-major, first-match dedup),
+    skip warnings for unreadable/binary files on stderr, ScanInputError when an
+    explicit file fails or a directory yields zero readable files, and the exact
+    empty-line artifacts the old '\\n'.join() produced between files.
+    """
+    if target.is_file():
+        try:
+            fb = _probe_binary(target)
+        except OSError as e:
+            raise ScanInputError(f"Error: cannot read {target}: {e}")
+        state: dict = {}
+        yield from _stream_file(fb, state)
+        return
+
+    globs = [p.strip() for p in pattern.split(",") if p.strip()]
+    seen: dict = {}
+    for g in globs:
+        for f in sorted(target.glob(f"**/{g}")):
+            if f.is_file():
+                seen[f] = None
+
+    read_ok = 0
+    prev: Optional[dict] = None  # terminal state of the previous READ file
+    for f in seen:
+        try:
+            fb = _probe_binary(f)
+        except OSError as e:
+            sys.stderr.write(f"[Pra-Effect] skipped {f}: {e}\n")
+            continue
+        # Legacy join separator: an empty line appears between two read files
+        # when the previous one ended with a newline or was empty. Emitted
+        # before this file's lines so it survives even if this file is empty.
+        if prev is not None and (prev["empty"] or prev["ends_nl"]):
+            yield ""
+        state = {}
+        yield from _stream_file(fb, state)
+        read_ok += 1
+        prev = {"empty": not state.get("any", False), "ends_nl": state.get("ends_nl", False)}
+    if read_ok == 0:
+        raise ScanInputError(
+            f"Error: no readable log files matched pattern '{pattern}' in {target}"
+        )
+
+
+class TracebackParser:
+    def __init__(self, cwd: Optional[Path] = None, src_dir: Optional[Path] = None):
+        self.cwd = cwd or Path.cwd()
+        self.src_dir = src_dir
+
+    def parse_python_traces(self, text: str) -> List[ParsedTrace]:
+        """Whole-text convenience API — thin wrapper over the streaming machine."""
+        return _collect_stream(PythonTraceStream(self.cwd, self.src_dir), text.splitlines())
+
+    def parse_node_traces(self, text: str) -> List[ParsedTrace]:
+        """Whole-text convenience API — thin wrapper over the streaming machine."""
+        return _collect_stream(NodeTraceStream(self.cwd, self.src_dir), text.splitlines())
+
+    def parse_all(self, text: str) -> List[ParsedTrace]:
+        py_traces = self.parse_python_traces(text)
+        node_traces = self.parse_node_traces(text)
+        return py_traces + node_traces
+
+
+def group_traces(traces: Iterable[ParsedTrace]) -> List[IncidentGroup]:
+    groups: "dict[str, IncidentGroup]" = {}
+    fold_traces(traces, groups)
     # Sorted by frequency descending
     return sorted(groups.values(), key=lambda g: g.occurrences, reverse=True)
 
@@ -901,53 +1199,6 @@ class PraEffectArgumentParser(argparse.ArgumentParser):
         sys.exit(2)
 
 
-def read_log_file(path: Path) -> Tuple[Optional[str], Optional[str]]:
-    """Read one log file. Returns (text, None) on success or (None, skip_reason)."""
-    try:
-        data = path.read_bytes()
-    except OSError as e:
-        return None, f"unreadable ({e.strerror or e})"
-    if b"\x00" in data[:8192]:
-        return None, "binary content (NUL byte)"
-    return data.decode("utf-8", errors="replace"), None
-
-
-def read_scan_target(target: Path, pattern: str) -> Tuple[Optional[str], int, int]:
-    """Read an explicit file or glob a directory (DEC-012).
-
-    Returns (text, files_seen, files_read). text is None when an explicit file
-    fails, or when a directory yielded zero readable files.
-    """
-    if target.is_file():
-        text, reason = read_log_file(target)
-        if text is None:
-            sys.stderr.write(f"Error: cannot read {target}: {reason}\n")
-            return None, 1, 0
-        return text, 1, 1
-
-    globs = [p.strip() for p in pattern.split(",") if p.strip()]
-    seen: dict = {}
-    for g in globs:
-        for f in sorted(target.glob(f"**/{g}")):
-            if f.is_file():
-                seen[f] = None
-    buf: List[str] = []
-    read_ok = 0
-    for f in seen:
-        text, reason = read_log_file(f)
-        if text is None:
-            sys.stderr.write(f"[Pra-Effect] skipped {f}: {reason}\n")
-            continue
-        buf.append(text)
-        read_ok += 1
-    if read_ok == 0:
-        sys.stderr.write(
-            f"Error: no readable log files matched pattern '{pattern}' in {target}\n"
-        )
-        return None, len(seen), 0
-    return "\n".join(buf), len(seen), read_ok
-
-
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = PraEffectArgumentParser(description="Pra-Effect: Local Stack Trace Deduplication")
     subparsers = parser.add_subparsers(dest="command")
@@ -958,6 +1209,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ingest_p.add_argument("--save", action="store_true", help="Save run into local SQLite history")
     ingest_p.add_argument("--db", type=str, default=None, help="Path to SQLite database file")
     ingest_p.add_argument("--html", type=str, default=None, help="Generate standalone interactive HTML report")
+    ingest_p.add_argument("--max-input-mb", type=float, default=DEFAULT_MAX_INPUT_MB,
+                          help="Input size backstop in MB (0 disables; streaming already bounds memory)")
 
     # Scan
     scan_p = subparsers.add_parser("scan", help="Scan log file or directory")
@@ -972,6 +1225,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     scan_p.add_argument("--save", action="store_true", help="Save run into local SQLite history")
     scan_p.add_argument("--db", type=str, default=None, help="Path to SQLite database file")
     scan_p.add_argument("--html", type=str, default=None, help="Generate standalone interactive HTML report")
+    scan_p.add_argument("--max-input-mb", type=float, default=DEFAULT_MAX_INPUT_MB,
+                        help="Input size backstop in MB (0 disables; streaming already bounds memory)")
 
     # History
     hist_p = subparsers.add_parser("history", help="View historical incident aggregation")
@@ -1026,25 +1281,29 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     src_dir = Path(src_val) if src_val else cwd
     t_start = time.perf_counter()
 
-    raw_text = ""
-    if cmd == "ingest":
-        raw_text = sys.stdin.read()
-    elif cmd == "scan":
-        target = Path(args.path)
-        if not target.exists():
-            sys.stderr.write(f"Error: path not found {target}\n")
-            return 1
-        raw_text, _seen, _read = read_scan_target(target, args.pattern)
-        if raw_text is None:
-            return 1
+    # DEC-016: --max-input-mb is a backstop on top of streaming, never a
+    # substitute for it. 0 disables the cap.
+    max_mb = getattr(args, "max_input_mb", DEFAULT_MAX_INPUT_MB)
+    max_bytes = int(max_mb * 1024 * 1024) if max_mb and max_mb > 0 else None
 
-    t_parser = TracebackParser(cwd=cwd, src_dir=src_dir)
-    traces = t_parser.parse_all(raw_text)
-    groups = group_traces(traces)
+    try:
+        if cmd == "ingest":
+            source = iter_stdin_lines()
+        else:
+            target = Path(args.path)
+            if not target.exists():
+                sys.stderr.write(f"Error: path not found {target}\n")
+                return 1
+            source = iter_scan_lines(target, args.pattern)
+        total_lines, total_exceptions, groups = stream_analyze(
+            source, cwd, src_dir, max_bytes
+        )
+    except (InputTooLargeError, ScanInputError) as e:
+        sys.stderr.write(f"{e}\n")
+        return 1
+
     duration_s = time.perf_counter() - t_start
-
-    total_lines = len(raw_text.splitlines())
-    report = format_terminal_report(total_lines, len(traces), groups, duration_s)
+    report = format_terminal_report(total_lines, total_exceptions, groups, duration_s)
     print(report)
 
     if save_val:
@@ -1052,7 +1311,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             db_path=db_path,
             command=cmd,
             total_lines=total_lines,
-            total_exceptions=len(traces),
+            total_exceptions=total_exceptions,
             duration_ms=duration_s * 1000.0,
             groups=groups,
         )
@@ -1063,7 +1322,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         html_out_path.parent.mkdir(parents=True, exist_ok=True)
         html_content = generate_html_report(
             total_lines=total_lines,
-            total_exceptions=len(traces),
+            total_exceptions=total_exceptions,
             groups=groups,
             duration_s=duration_s,
         )

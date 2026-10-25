@@ -400,6 +400,73 @@ def test_html_escapes_all_trace_fields():
     assert "PII redaction" in doc, "PII disclaimer footer missing"
 
 
+def test_golden_cli_parity():
+    """TSK-015: streaming refactor must be byte-identical to the v0.2 baseline.
+
+    Baselines in golden/ were captured from the pre-streaming implementation
+    (duration scrubbed). Covers: mixed ingest, chained collapse, python-then-
+    node ordering on reversed input, CRLF files, multi-file dir scan with the
+    legacy join line-count artifacts, and binary skip warnings.
+    """
+    import re
+    gold = REPO_DIR / "golden"
+
+    def scrub(s):
+        return re.sub(r"(Duration:\s+)[\d.]+ms", r"\1<TIME>", s)
+
+    ingest_cases = {
+        "g1_ingest_mixed.txt": "mixed.log",
+        "g2_ingest_chained.txt": "chained.log",
+        "g3_ingest_reversed.txt": "reversed.log",
+    }
+    for out_name, in_name in ingest_cases.items():
+        p = subprocess.run(
+            [sys.executable, str(SCRIPT), "ingest"],
+            input=(gold / in_name).read_text(encoding="utf-8"),
+            text=True, capture_output=True, cwd=str(REPO_DIR),
+        )
+        assert p.returncode == 0, (out_name, p.stderr)
+        want = (gold / out_name).read_text(encoding="utf-8")
+        assert scrub(p.stdout) == want, f"stdout drift vs baseline: {out_name}"
+
+    scan_cases = {
+        "g4_scan_crlf.txt": ["scan", str(gold / "crlf.log")],
+        "g5_scan_dir.txt": ["scan", str(gold / "dir")],
+        "g6_scan_mixed.txt": ["scan", str(gold / "mixed.log")],
+    }
+    for out_name, argv in scan_cases.items():
+        p = subprocess.run(
+            [sys.executable, str(SCRIPT)] + argv,
+            text=True, capture_output=True, cwd=str(REPO_DIR),
+        )
+        assert p.returncode == 0, (out_name, p.stderr)
+        want = (gold / out_name).read_text(encoding="utf-8")
+        assert scrub(p.stdout) == want, f"stdout drift vs baseline: {out_name}"
+        err_file = gold / (out_name + ".stderr")
+        if err_file.exists():
+            assert p.stderr.strip() == err_file.read_text(encoding="utf-8").strip(), (
+                f"stderr drift vs baseline: {out_name}"
+            )
+
+
+def test_max_input_mb_backstop():
+    """DEC-016: --max-input-mb rejects oversized input with exit 1."""
+    p = subprocess.run(
+        [sys.executable, str(SCRIPT), "ingest", "--max-input-mb", "0.00001"],
+        input=FIXTURE_PYTHON_LOG, text=True, capture_output=True, cwd=str(REPO_DIR),
+    )
+    assert p.returncode == 1, f"expected exit 1 on cap violation, got {p.returncode}"
+    assert "max-input-mb" in p.stderr, p.stderr
+    assert "Pra-Effect — Analysis Complete" not in p.stdout, "no report on rejected input"
+
+    # Cap disabled with 0 -> normal success
+    p2 = subprocess.run(
+        [sys.executable, str(SCRIPT), "ingest", "--max-input-mb", "0"],
+        input=FIXTURE_PYTHON_LOG, text=True, capture_output=True, cwd=str(REPO_DIR),
+    )
+    assert p2.returncode == 0, p2.stderr
+
+
 def test_fingerprint_version_isolation():
     """TSK-012: foreign fingerprint versions never leak into aggregated history."""
     from pra_effect import init_db, query_historical_incidents, save_run_to_db
@@ -482,6 +549,12 @@ class TestPraEffect(unittest.TestCase):
 
     def test_fingerprint_version_isolation(self):
         test_fingerprint_version_isolation()
+
+    def test_golden_cli_parity(self):
+        test_golden_cli_parity()
+
+    def test_max_input_mb_backstop(self):
+        test_max_input_mb_backstop()
 
 
 if __name__ == "__main__":
