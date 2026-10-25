@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Iterable, Iterator, List, Optional, Sequence, Tuple
 
 FINGERPRINT_VERSION = "fingerprint_v1"
+__version__ = "1.0.0"
 MAX_LINE_LENGTH = 4096
 MAX_CONTINUATION_LINES = 5
 MAX_INTERLEAVED_LINES = 2
@@ -1200,7 +1201,12 @@ class PraEffectArgumentParser(argparse.ArgumentParser):
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
+    # v1.0.0 release-consistency: CLI version must match pyproject + tag.
+    if argv and argv[0] == "--version":
+        print(f"pra-effect {__version__}")
+        return 0
     parser = PraEffectArgumentParser(description="Pra-Effect: Local Stack Trace Deduplication")
+    parser.add_argument("--version", action="version", version=f"pra-effect {__version__}")
     subparsers = parser.add_subparsers(dest="command")
 
     # Ingest

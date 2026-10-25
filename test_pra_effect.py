@@ -23,6 +23,20 @@ from pra_effect import (
     group_traces,
     normalize_message,
 )
+import pra_effect
+
+
+def test_release_version_consistency():
+    """TSK-019: package, CLI, and pyproject version must agree at release time."""
+    import re
+    pyproject = Path(__file__).parent / "pyproject.toml"
+    m = re.search(r'(?m)^version\s*=\s*"([^"]+)"', pyproject.read_text(encoding="utf-8"))
+    assert m, "pyproject.toml missing [project] version field"
+    pkg_version = m.group(1)
+    assert pra_effect.__version__ == pkg_version, (
+        f"version drift: CLI __version__={pra_effect.__version__} != pyproject={pkg_version}"
+    )
+    assert pkg_version == "1.0.0", f"release expected 1.0.0, got {pkg_version}"
 
 FIXTURE_PYTHON_LOG = """
 INFO 2026-10-24 10:00:01 Starting service
@@ -590,6 +604,9 @@ class TestPraEffect(unittest.TestCase):
 
     def test_streaming_pipeline_memory_regression(self):
         test_streaming_pipeline_memory_regression()
+
+    def test_release_version_consistency(self):
+        test_release_version_consistency()
 
 
 if __name__ == "__main__":

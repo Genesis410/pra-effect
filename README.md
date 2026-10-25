@@ -56,6 +56,9 @@ python app.py 2>&1 | pra-effect ingest
 
 # Save run to SQLite and export an HTML dashboard
 pytest 2>&1 | pra-effect ingest --save --html report.html
+
+# Check installed version (must match pyproject + git tag)
+pra-effect --version
 ```
 
 ### 2. Scan Existing Log Files
@@ -170,3 +173,12 @@ Tests cover:
 ## License
 
 MIT License. See [LICENSE](LICENSE) for details.
+
+---
+
+## Release & Changelog
+
+See [CHANGELOG.md](CHANGELOG.md) for the version history. Current release: `1.0.0`.
+
+Version consistency across the package (`pyproject.toml`), the CLI (`--version`), and
+the git tag is enforced by `test_release_version_consistency`.

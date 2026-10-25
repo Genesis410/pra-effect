@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pra-effect"
-version = "0.3.0"
+version = "1.0.0"
 description = "Zero-dependency local CLI for parsing, deduplicating, and fingerprinting Python & Node.js error stack traces."
 readme = "README.md"
 requires-python = ">=3.9"
@@ -12,7 +12,7 @@ license = { text = "MIT" }
 authors = [{ name = "Genesis410" }]
 keywords = ["stacktrace", "deduplication", "cli", "incident-management", "logging", "developer-tools"]
 classifiers = [
-    "Development Status :: 4 - Beta",
+    "Development Status :: 5 - Production/Stable",
     "Environment :: Console",
     "Intended Audience :: Developers",
     "License :: OSI Approved :: MIT License",
