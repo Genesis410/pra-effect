@@ -113,6 +113,24 @@ RE_GO_FILE_LINE = re.compile(r"^\s+(.+\.go):(\d+)(?:\s+\+0x[0-9a-fA-F]+)?$")
 RE_GO_PTR = re.compile(r"\b0x[0-9a-fA-F]+\b")
 RE_GO_GOROUTINE_ID = re.compile(r"\bgoroutine\s+\d+\b")
 
+# Rust panic streaming patterns (TSK-026B)
+# Header: "thread 'main' panicked at src/main.rs:12:5" or bare "panicked at <loc>"
+RE_RUST_PANIC_HEADER = re.compile(
+    r"^thread\s+'[^']+'\s+panicked(?:\s+at\s+(.+?))?(?:$|\s)"
+)
+# Also bare "panicked at <loc>" (release builds without thread name)
+RE_RUST_PANIC_BARE = re.compile(r"^panicked(?:\s+at\s+(.+?))?(?:$|\s)")
+# Frame: "   0: <symbol>   1: <symbol>" — digits + colon + name (with optional demangling)
+RE_RUST_FRAME = re.compile(r"^\s*\d+:\s+(\S.*)$")
+# Optional location suffix on frame: "... at src/main.rs:12:5)" or "... (at src/main.rs:12:5)"
+# (file part cannot contain ':'); optional '(' before 'at'
+RE_RUST_LOC_SUFFIX = re.compile(r"\s*\(?\s*at\s+([^\s:]+):(\d+)(?::(\d+))?\s*\)?\s*$")
+# Hash-mangled suffix normalization: ::h[0-9a-f]{16}
+RE_RUST_HASH_SUFFIX = re.compile(r"::h[0-9a-f]{16}(?!\w)")
+
+# Structured JSON Lines patterns (TSK-026C)
+# Recognized JSONL error fields (case-insensitive matching in _step, not here)
+
 # Known vendor / runtime directory segments
 VENDOR_SEGMENTS = {
     "site-packages",
@@ -158,7 +176,7 @@ class StackFrame:
 
 @dataclass
 class ParsedTrace:
-    runtime: str  # "python" | "node" | "java" | "foreign"
+    runtime: str  # "python" | "node" | "java" | "go" | "rust" | "jsonl" | "foreign"
     error_type: str
     original_message: str
     normalized_message: str
@@ -789,6 +807,297 @@ class GoTraceStream:
         return trace
 
 
+class JsonlTraceStream:
+    """Line-fed structured JSON Lines parser (TSK-026C).
+
+    Each line is an independent JSON object; error lines are identified by
+    level/error field. Stack traces are embedded in JSON fields, not
+    multi-line dumps. No multi-line state needed — O(1) per line.
+
+    Recognized error-level levels (case-insensitive): "error", "err", "critical", "fatal".
+    Malformed JSON lines are skipped (counted, not emitted as traces).
+
+    Invariants:
+    - O(1) streaming: one JSON object per feed call.
+    - Malformed lines do not crash; they are skipped.
+    - Zero new dependencies.
+    """
+
+    _ERROR_LEVELS = {"error", "err", "critical", "fatal"}
+
+    def __init__(self, cwd: Path, src_dir: Optional[Path] = None):
+        self.cwd = cwd
+        self.src_dir = src_dir
+        self.malformed_count = 0
+
+    def feed(self, line: str, truncated: bool) -> List[ParsedTrace]:
+        stripped = line.strip()
+        if not stripped:
+            return []
+        # Fast pre-filter: must start with '{' to be a JSONL object
+        if not stripped.startswith("{"):
+            return []
+        try:
+            obj = json.loads(stripped)
+        except (json.JSONDecodeError, ValueError):
+            self.malformed_count += 1
+            return []
+        if not isinstance(obj, dict):
+            return []
+
+        # Identify error line
+        level = str(obj.get("level", "")).lower()
+        if level not in self._ERROR_LEVELS:
+            # Also accept "error" key presence with stack/message
+            if "error" not in obj and "stack_trace" not in obj and "msg" not in obj:
+                return []
+
+        # Extract fields
+        msg = str(obj.get("message", obj.get("msg", obj.get("error", "")))).strip()
+        stack = str(obj.get("stack_trace", obj.get("stack", obj.get("traceback", "")))).strip()
+        err_type_raw = str(obj.get("error_type", obj.get("type", ""))).strip()
+
+        # Error type: use explicit field, else infer from first line of stack
+        if err_type_raw:
+            err_type = err_type_raw
+        elif stack:
+            # First line of stack often carries the exception class, e.g. "ValueError: bad"
+            first = stack.split("\n", 1)[0].strip()
+            # Try to extract "<ErrorType>" from "ExceptionName: msg" pattern
+            m = re.match(r"^([A-Za-z_][\w.]*(?:Error|Exception|Fault|Warning))\s*:?", first)
+            err_type = m.group(1) if m else "UnknownError"
+        else:
+            err_type = "JsonlError"
+
+        # Parse embedded stack into frames if present
+        frames: List[StackFrame] = []
+        if stack:
+            frames = self._parse_embedded_stack(stack)
+
+        norm_msg, is_trunc = normalize_message(msg)
+        trace = ParsedTrace(
+            runtime="jsonl",
+            error_type=err_type,
+            original_message=msg,
+            normalized_message=norm_msg,
+            frames=frames,
+            raw_text=stripped,
+            is_truncated=is_trunc,
+        )
+        trace.fingerprint = trace.compute_fingerprint()
+        return [trace]
+
+    def finish(self) -> List[ParsedTrace]:
+        return []  # stateless — nothing pending
+
+    @staticmethod
+    def _parse_embedded_stack(stack: str) -> List[StackFrame]:
+        """Parse embedded multi-line stack trace from a JSONL field.
+
+        Handles Python, Java, and generic formats found in JSON field values.
+        """
+        frames: List[StackFrame] = []
+        lines = stack.split("\n")
+        for raw in lines:
+            line = raw.strip()
+            if not line:
+                continue
+            # Python-style: File "path", line N, in func
+            m = re.match(r'^File\s+"([^"]+)",\s*line\s*(\d+)(?:,\s*in\s*(\S+))?', line)
+            if m:
+                fp = m.group(1)
+                ln = int(m.group(2))
+                fn = m.group(3) or ""
+                frames.append(StackFrame(
+                    filepath=fp, line_number=ln,
+                    function_name=fn,
+                    is_in_project=False, normalized_path=fp,
+                ))
+                continue
+            # Java-style: at pkg.Class.method(File.java:42)
+            m = re.match(r"^at\s+([a-zA-Z0-9_.$/]+)\(([^:]+):(\d+)\)", line)
+            if m:
+                frames.append(StackFrame(
+                    filepath=m.group(2), line_number=int(m.group(3)),
+                    function_name=m.group(1),
+                    is_in_project=False, normalized_path=m.group(2),
+                ))
+                continue
+            # Generic Node/Rust: frame lines with file:line pattern
+            m = re.match(r"^(?:\d+:\s*)?(\S+)\s+at\s+(\S+):(\d+)", line)
+            if m:
+                frames.append(StackFrame(
+                    filepath=m.group(2), line_number=int(m.group(3)),
+                    function_name=m.group(1),
+                    is_in_project=False, normalized_path=m.group(2),
+                ))
+        return frames
+
+
+class RustTraceStream:
+    """Line-fed Rust panic parser (TSK-026B).
+
+    Handles format (release/debug):
+      thread 'main' panicked at src/main.rs:12:5     ← header with location
+      <optional panic message line>
+      stack backtrace:                                 ← backtrace section header
+         0: std::panicking::panic                       ← frame: index + symbol
+         1: <fn> (at src/main.rs:12:5)                  ← optional location suffix
+         2: ...
+      <or backtrace may be omitted entirely — truncated>
+
+    States: idle → header → (message) → frames → idle
+    - Truncated stack (EOF mid-frame): emitted via finish(), is_truncated=True
+    - Hash-mangled symbol suffixes ::hXXXX stripped for stable fingerprints
+    - Dynamic IDs / UUIDs / hex addresses normalized in message
+    - Zero new dependencies.
+    """
+
+    def __init__(self, cwd: Path, src_dir: Optional[Path] = None):
+        self.cwd = cwd
+        self.src_dir = src_dir
+        self.pend: "deque[Tuple[str, bool]]" = deque()
+        self._reset()
+
+    def _reset(self) -> None:
+        self.mode = "idle"       # idle | header | frames
+        self.raw_msg = ""
+        self.err_type = "RustPanic"
+        self.frames: List[StackFrame] = []
+        self.trace_lines: List[Tuple[str, bool]] = []
+        self.trunc_any = False
+
+    def feed(self, line: str, truncated: bool) -> List[ParsedTrace]:
+        self.pend.append((line, truncated))
+        return self._drain()
+
+    def finish(self) -> List[ParsedTrace]:
+        out = self._drain()
+        if self.mode == "frames":
+            out.append(self._make_trace())
+        self._reset()
+        return out
+
+    def _drain(self) -> List[ParsedTrace]:
+        out: List[ParsedTrace] = []
+        stall = 0
+        while self.pend:
+            line, truncated = self.pend[0]
+            if self._step(line, truncated, out):
+                self.pend.popleft()
+                stall = 0
+            else:
+                stall += 1
+                if stall > 10_000:
+                    raise RuntimeError("RustTraceStream made no progress")
+        return out
+
+    def _step(self, line: str, truncated: bool, out: List[ParsedTrace]) -> bool:
+        stripped = line.strip()
+
+        if self.mode == "idle":
+            m = RE_RUST_PANIC_HEADER.match(stripped) or RE_RUST_PANIC_BARE.match(stripped)
+            if m:
+                self.raw_msg = (m.group(1) or "").strip()
+                self.err_type = "RustPanic"
+                self.mode = "header"
+                self.trace_lines = [(line, truncated)]
+                self.trunc_any = truncated
+            return True
+
+        if self.mode == "header":
+            # Optional message line before "stack backtrace:"
+            if not stripped:
+                self.trace_lines.append((line, truncated))
+                return True
+            if stripped.lower().startswith("stack backtrace"):
+                self.trace_lines.append((line, truncated))
+                self.trunc_any = self.trunc_any or truncated
+                self.mode = "frames"
+                return True
+            # A non-backtrace content line: it's the panic message
+            self.raw_msg = (self.raw_msg + " " + stripped).strip() if self.raw_msg else stripped
+            self.trace_lines.append((line, truncated))
+            self.trunc_any = self.trunc_any or truncated
+            return True
+
+        # mode == "frames"
+        if not stripped:
+            return True  # allow internal blank lines
+
+        # New panic header starting — end current trace, restart
+        m2 = RE_RUST_PANIC_HEADER.match(stripped) or RE_RUST_PANIC_BARE.match(stripped)
+        if m2:
+            out.append(self._make_trace())
+            self._reset()
+            return False  # re-dispatch
+
+        # Frame line: "   N: symbol   [at file:line:col]"
+        fm = RE_RUST_FRAME.match(stripped)
+        if fm:
+            symbol = fm.group(1)
+            # Extract location suffix if present
+            loc_m = RE_RUST_LOC_SUFFIX.search(symbol)
+            filepath = ""
+            line_no = 0
+            if loc_m:
+                filepath = loc_m.group(1)
+                line_no = int(loc_m.group(2))
+                symbol = symbol[: loc_m.start()].rstrip().rstrip(")").rstrip("(").rstrip()
+
+            symbol = self._normalize_rust_symbol(symbol)
+
+            # Determine if project frame
+            norm_p, in_proj = (
+                normalize_frame_path(filepath, self.cwd, self.src_dir)
+                if filepath else ("", False)
+            )
+            # Frames with location but no vendor path are likely project
+            if filepath and not any(v in filepath.lower().replace("\\", "/") for v in VENDOR_SEGMENTS):
+                in_proj = True
+
+            self.frames.append(StackFrame(
+                filepath=filepath,
+                line_number=line_no,
+                function_name=symbol,
+                is_in_project=in_proj,
+                normalized_path=norm_p,
+            ))
+            self.trace_lines.append((line, truncated))
+            self.trunc_any = self.trunc_any or truncated
+            return True
+
+        # Unrecognized line (e.g. "note: Some external frames suppressed") — end dump
+        out.append(self._make_trace())
+        self._reset()
+        return False
+
+    def _normalize_rust_msg(self, msg: str) -> str:
+        """Normalize Rust panic message: strip dynamic IDs and hex pointers."""
+        msg = RE_HEX.sub("<HEX>", msg)
+        msg, _ = normalize_message(msg)
+        return msg
+
+    def _normalize_rust_symbol(self, symbol: str) -> str:
+        """Normalize Rust symbol: strip ::hXXXX hash mangling, keep path stable."""
+        symbol = RE_RUST_HASH_SUFFIX.sub("", symbol)
+        return symbol.strip()
+
+    def _make_trace(self) -> ParsedTrace:
+        raw_block = "\n".join(l for l, _ in self.trace_lines)
+        norm_msg = self._normalize_rust_msg(self.raw_msg)
+        trace = ParsedTrace(
+            runtime="rust",
+            error_type=self.err_type or "RustPanic",
+            original_message=self.raw_msg,
+            normalized_message=norm_msg,
+            frames=self.frames,
+            raw_text=raw_block,
+            is_truncated=self.trunc_any,
+        )
+        trace.fingerprint = trace.compute_fingerprint()
+        return trace
+
 
 class JavaTraceStream:
     """Line-fed Java stack trace parser with Caused-by chaining support (TSK-025)."""
@@ -1026,10 +1335,14 @@ def stream_analyze(
     node = NodeTraceStream(cwd, src_dir)
     java = JavaTraceStream(cwd, src_dir)
     go = GoTraceStream(cwd, src_dir)
+    rust = RustTraceStream(cwd, src_dir)
+    jsonl = JsonlTraceStream(cwd, src_dir)
     fpy: "dict[str, IncidentGroup]" = {}
     fnode: "dict[str, IncidentGroup]" = {}
     fjava: "dict[str, IncidentGroup]" = {}
     fgo: "dict[str, IncidentGroup]" = {}
+    frust: "dict[str, IncidentGroup]" = {}
+    fjsonl: "dict[str, IncidentGroup]" = {}
     fforeign: "dict[str, IncidentGroup]" = {}
     total_lines = 0
     total_exceptions = 0
@@ -1047,10 +1360,16 @@ def stream_analyze(
         gl = go.feed(line, truncated)
         fold_traces(gl, fgo)
         total_exceptions += len(gl)
+        rl = rust.feed(line, truncated)
+        fold_traces(rl, frust)
+        total_exceptions += len(rl)
+        Jl = jsonl.feed(line, truncated)
+        fold_traces(Jl, fjsonl)
+        total_exceptions += len(Jl)
 
-        # Foreign stack detection (fatal errors, core dumps — Go panic handled by GoTraceStream)
+        # Foreign stack detection (fatal errors, core dumps — Go/Rust panic handled by dedicated SMs)
         fmatch = RE_FOREIGN_HEADER.match(line.strip())
-        if fmatch and not tl and not nl and not jl and not gl:
+        if fmatch and not tl and not nl and not jl and not gl and not rl:
             header_str = line.strip()
             err_type = "FatalError"
             if "SIGSEGV" in header_str:
@@ -1083,8 +1402,14 @@ def stream_analyze(
     gl2 = go.finish()
     fold_traces(gl2, fgo)
     total_exceptions += len(gl2)
+    rl2 = rust.finish()
+    fold_traces(rl2, frust)
+    total_exceptions += len(rl2)
+    Jl2 = jsonl.finish()
+    fold_traces(Jl2, fjsonl)
+    total_exceptions += len(Jl2)
 
-    merged = {**fpy, **fnode, **fjava, **fgo, **fforeign}
+    merged = {**fpy, **fnode, **fjava, **fgo, **frust, **fjsonl, **fforeign}
     if scrub_secrets:
         for g in merged.values():
             g.representative_trace = scrub_secrets_text(g.representative_trace)

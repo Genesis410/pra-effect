@@ -827,6 +827,120 @@ Caused by: java.lang.NullPointerException: Order payload is null
             self.assertIsNone(outside_preview)
 
 
+    def test_rust_panic_basic(self):
+        """TSK-026B: Rust panic with full backtrace, location suffixes, and symbol normalization."""
+        log = """\
+thread 'main' panicked at src/main.rs:12:5
+assertion `left == right` failed
+  left: 1
+  right: 2
+stack backtrace:
+   0: std::panicking::panic_fmt::h1a2b3c4d5e6f7890
+   1: core::panicking::panic_bounds_check::h9f8e7d6c5b4a3210
+   2: myapp::process (at src/process.rs:42:10)
+   3: myapp::main (at src/main.rs:12:5)
+"""
+        cwd = Path(".")
+        traces = pra_effect._collect_stream(pra_effect.RustTraceStream(cwd), log.splitlines())
+        self.assertEqual(len(traces), 1)
+        t = traces[0]
+        self.assertEqual(t.runtime, "rust")
+        self.assertEqual(t.error_type, "RustPanic")
+        # Hash mangling stripped from symbol
+        panic_fmt = [f for f in t.frames if "panic_fmt" in f.function_name]
+        self.assertEqual(len(panic_fmt), 1)
+        self.assertNotIn("h1a2b3c4d5e6f7890", panic_fmt[0].function_name)
+        # Frame with location
+        proc = [f for f in t.frames if "process" in f.function_name]
+        self.assertEqual(len(proc), 1)
+        self.assertEqual(proc[0].filepath, "src/process.rs")
+        self.assertEqual(proc[0].line_number, 42)
+
+    def test_rust_panic_dedup(self):
+        """TSK-026B: two identical Rust panics group to 1 incident, occurrences=2."""
+        single = """\
+thread 'worker' panicked at src/worker.rs:8:1
+index out of bounds: the length is 0 but the index is 0
+stack backtrace:
+   0: std::panicking::panic_fmt
+   1: myapp::worker::run (at src/worker.rs:8:1)
+"""
+        log = single + single
+        cwd = Path(".")
+        _, _, groups = pra_effect.stream_analyze(log.splitlines(), cwd)
+        rust_groups = [g for g in groups if g.runtime == "rust"]
+        self.assertEqual(len(rust_groups), 1)
+        self.assertEqual(rust_groups[0].occurrences, 2)
+
+    def test_rust_panic_hash_mangling_stable(self):
+        """TSK-026B: ::hXXXX suffixes produce identical fingerprints."""
+        log1 = """\
+thread 'main' panicked at src/main.rs:1:1
+oh no
+stack backtrace:
+   0: myapp::run::h1111111111111111 (at src/main.rs:1:1)
+"""
+        log2 = """\
+thread 'main' panicked at src/main.rs:1:1
+oh no
+stack backtrace:
+   0: myapp::run::h2222222222222222 (at src/main.rs:1:1)
+"""
+        cwd = Path(".")
+        t1 = pra_effect._collect_stream(pra_effect.RustTraceStream(cwd), log1.splitlines())[0]
+        t2 = pra_effect._collect_stream(pra_effect.RustTraceStream(cwd), log2.splitlines())[0]
+        self.assertEqual(t1.fingerprint, t2.fingerprint)
+
+    def test_rust_panic_no_false_positive(self):
+        """TSK-026B: Rust SM silent on Go panic lines."""
+        log = "panic: runtime error: index out of range\n\ngoroutine 1 [running]:\nmain.foo()\n\t/proj/main.go:5\n\n"
+        cwd = Path(".")
+        traces = pra_effect._collect_stream(pra_effect.RustTraceStream(cwd), log.splitlines())
+        self.assertEqual(traces, [])
+
+    def test_jsonl_basic_error_line(self):
+        """TSK-026C: basic JSONL error line emits a trace with correct fields."""
+        import json as _json
+        line = _json.dumps({
+            "level": "error",
+            "message": "DB connection failed",
+            "stack_trace": "ValueError: bad value\n  File app.py, line 10, in main",
+        })
+        cwd = Path(".")
+        traces = pra_effect._collect_stream(pra_effect.JsonlTraceStream(cwd), [line])
+        self.assertEqual(len(traces), 1)
+        t = traces[0]
+        self.assertEqual(t.runtime, "jsonl")
+        self.assertEqual(t.error_type, "ValueError")
+        self.assertEqual(t.original_message, "DB connection failed")
+
+    def test_jsonl_malformed_skipped(self):
+        """TSK-026C: malformed JSON lines don't crash and produce no traces."""
+        cwd = Path(".")
+        sm = pra_effect.JsonlTraceStream(cwd)
+        traces = pra_effect._collect_stream(sm, ['not json', '{"broken": ', ''])
+        self.assertEqual(traces, [])
+        self.assertEqual(sm.malformed_count, 1)
+
+    def test_jsonl_non_error_level_skipped(self):
+        """TSK-026C: INFO/DEBUG lines without error fields produce no traces."""
+        import json as _json
+        info = _json.dumps({"level": "info", "message": "starting service"})
+        debug = _json.dumps({"level": "debug", "message": "db pool ready"})
+        cwd = Path(".")
+        traces = pra_effect._collect_stream(pra_effect.JsonlTraceStream(cwd), [info, debug])
+        self.assertEqual(traces, [])
+
+    def test_jsonl_grouping_dedup(self):
+        """TSK-026C: two identical JSONL error lines group to 1 incident."""
+        import json as _json
+        line = _json.dumps({"level": "error", "message": "timeout", "error_type": "TimeoutError"})
+        cwd = Path(".")
+        _, _, groups = pra_effect.stream_analyze([line, line], cwd)
+        jsonl_groups = [g for g in groups if g.runtime == "jsonl"]
+        self.assertEqual(len(jsonl_groups), 1)
+        self.assertEqual(jsonl_groups[0].occurrences, 2)
+
     def test_go_panic_basic(self):
         """TSK-026A: basic Go panic with full goroutine dump."""
         log = """\
