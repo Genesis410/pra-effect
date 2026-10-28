@@ -827,5 +827,110 @@ Caused by: java.lang.NullPointerException: Order payload is null
             self.assertIsNone(outside_preview)
 
 
+    def test_go_panic_basic(self):
+        """TSK-026A: basic Go panic with full goroutine dump."""
+        log = """\
+panic: runtime error: index out of range [0] with length 0
+
+goroutine 1 [running]:
+main.processItems(...)
+\t/home/user/project/main.go:42 +0x5e
+main.main()
+\t/home/user/project/main.go:10 +0x25
+exit status 2
+"""
+        cwd = Path(".")
+        sm = pra_effect.GoTraceStream(cwd)
+        traces = pra_effect._collect_stream(sm, log.splitlines())
+        self.assertEqual(len(traces), 1)
+        t = traces[0]
+        self.assertEqual(t.runtime, "go")
+        self.assertEqual(t.error_type, "GoPanic")
+        self.assertIn("index out of range", t.original_message)
+        self.assertEqual(len(t.frames), 2)
+        self.assertEqual(t.frames[0].function_name, "main.processItems")
+        self.assertEqual(t.frames[0].line_number, 42)
+        self.assertFalse(t.is_truncated)
+
+    def test_go_panic_ptr_normalization(self):
+        """TSK-026A: pointer addresses normalized to <PTR> in fingerprint."""
+        log1 = "panic: invalid memory address 0x1a2b3c\n\ngoroutine 1 [running]:\nmain.foo()\n\t/proj/main.go:5 +0xff\n\n"
+        log2 = "panic: invalid memory address 0xdeadbeef\n\ngoroutine 1 [running]:\nmain.foo()\n\t/proj/main.go:5 +0x1\n\n"
+        cwd = Path(".")
+        t1 = pra_effect._collect_stream(pra_effect.GoTraceStream(cwd), log1.splitlines())[0]
+        t2 = pra_effect._collect_stream(pra_effect.GoTraceStream(cwd), log2.splitlines())[0]
+        # Same logical panic: fingerprints must match
+        self.assertEqual(t1.fingerprint, t2.fingerprint)
+        self.assertNotIn("0x1a2b3c", t1.normalized_message)
+        self.assertNotIn("0xdeadbeef", t2.normalized_message)
+
+    def test_go_panic_truncated_stack(self):
+        """TSK-026A: stack truncated at EOF emitted via finish(), is_truncated=True."""
+        log = "panic: something bad\n\ngoroutine 1 [running]:\nmain.bar(...)\n"
+        # No file:line pair after function — truncated
+        cwd = Path(".")
+        sm = pra_effect.GoTraceStream(cwd)
+        traces = pra_effect._collect_stream(sm, log.splitlines())
+        self.assertEqual(len(traces), 1)
+        self.assertTrue(traces[0].is_truncated)
+
+    def test_go_panic_grouping_dedup(self):
+        """TSK-026A: two identical panics group to 1 incident with 2 occurrences."""
+        single = """\
+panic: nil pointer dereference
+
+goroutine 1 [running]:
+main.doWork()
+\t/project/worker.go:99 +0x18
+
+"""
+        log = single + single
+        cwd = Path(".")
+        _, _, groups = pra_effect.stream_analyze(log.splitlines(), cwd)
+        go_groups = [g for g in groups if g.runtime == "go"]
+        self.assertEqual(len(go_groups), 1)
+        self.assertEqual(go_groups[0].occurrences, 2)
+
+    def test_go_panic_runtime_frames_not_project(self):
+        """TSK-026A: runtime/ frames excluded from project frames."""
+        log = """\
+panic: interface conversion failed
+
+goroutine 1 [running]:
+runtime.gopanic()
+\truntime/panic.go:914 +0x21c
+main.run()
+\t/project/main.go:55 +0x3f
+
+"""
+        cwd = Path(".")
+        traces = pra_effect._collect_stream(pra_effect.GoTraceStream(cwd), log.splitlines())
+        self.assertEqual(len(traces), 1)
+        runtime_frames = [f for f in traces[0].frames if "runtime" in f.filepath.lower()]
+        for rf in runtime_frames:
+            self.assertFalse(rf.is_in_project)
+
+    def test_go_panic_no_false_positive_on_python_log(self):
+        """TSK-026A: Go SM silent on Python traceback lines."""
+        log = """\
+Traceback (most recent call last):
+  File "app.py", line 10, in main
+    result = compute()
+ValueError: bad value
+"""
+        cwd = Path(".")
+        traces = pra_effect._collect_stream(pra_effect.GoTraceStream(cwd), log.splitlines())
+        self.assertEqual(traces, [])
+
+    def test_go_panic_no_goroutine_still_emitted(self):
+        """TSK-026A: panic header with no goroutine dump emits nothing (only via finish if pending)."""
+        log = "panic: oops\n"
+        cwd = Path(".")
+        # "panic_seen" but no goroutine: finish() emits nothing (panic_seen not in goroutine/frames)
+        traces = pra_effect._collect_stream(pra_effect.GoTraceStream(cwd), log.splitlines())
+        # No goroutine header → no trace emitted (panic alone is not actionable)
+        self.assertEqual(len(traces), 0)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

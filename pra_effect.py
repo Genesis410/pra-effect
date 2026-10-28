@@ -95,10 +95,23 @@ RE_JAVA_CAUSED_BY = re.compile(
     r"^Caused by:\s+([a-zA-Z0-9_$.]+(?:Exception|Error|Throwable))(?::\s*(.*))?$"
 )
 
-# Foreign stack patterns (Go panic, C++ core dumps, Rust panics) (TSK-025)
+# Foreign stack patterns (C++ core dumps, signals — Go/Rust handled by dedicated SM) (TSK-025)
 RE_FOREIGN_HEADER = re.compile(
-    r"^(?:panic:\s*(.*)|fatal error:\s*(.*)|SIGSEGV|SIGABRT|thread '[^']+' panicked at)"
+    r"^(?:fatal error:\s*(.*)|SIGSEGV|SIGABRT)"
 )
+
+# Go panic streaming patterns (TSK-026A)
+# Header: "panic: <message>" or "panic(<type>): <msg>"
+RE_GO_PANIC_HEADER = re.compile(r"^panic(?:\([^)]*\))?:\s*(.*)")
+# Goroutine header: "goroutine 1 [running]:"  (any status)
+RE_GO_GOROUTINE = re.compile(r"^goroutine\s+(\d+)\s+\[([^\]]+)\]:$")
+# Frame function: "main.foo(...)" or "runtime.gopanic(...)"
+RE_GO_FUNC = re.compile(r"^([a-zA-Z0-9_./\(\)]*[a-zA-Z0-9_])(?:\(.*\))?$")
+# Frame file line: "\t/path/to/file.go:42 +0x5e"
+RE_GO_FILE_LINE = re.compile(r"^\s+(.+\.go):(\d+)(?:\s+\+0x[0-9a-fA-F]+)?$")
+# Normalization: goroutine ID and memory addresses
+RE_GO_PTR = re.compile(r"\b0x[0-9a-fA-F]+\b")
+RE_GO_GOROUTINE_ID = re.compile(r"\bgoroutine\s+\d+\b")
 
 # Known vendor / runtime directory segments
 VENDOR_SEGMENTS = {
@@ -565,6 +578,218 @@ class NodeTraceStream:
         return trace
 
 
+class GoTraceStream:
+    """Line-fed Go panic parser (TSK-026A).
+
+    Handles format:
+      panic: <message>         ← header (may include type assertion, runtime error, etc.)
+      [blank line optional]
+      goroutine N [status]:    ← goroutine header (any status string)
+      pkg.Function(...)        ← function name line
+      \t/path/to/file.go:L    ← file+line (pairs with function above)
+      ...more goroutines...
+      exit status 2            ← noise: ignored
+
+    State machine: idle → panic_seen → goroutine → frames → idle
+    Multiple goroutines in one panic dump are folded into a single trace
+    (first goroutine frames only — matching runtime behavior where goroutine 1
+    is always the panicking goroutine and its dump appears first).
+
+    Invariants:
+    - O(1) streaming: no buffering of whole file.
+    - Truncated stack (EOF mid-frame): emitted via finish().
+    - Pointer addresses normalized to <PTR>; goroutine IDs stripped from message.
+    - Zero new dependencies.
+    """
+
+    def __init__(self, cwd: Path, src_dir: Optional[Path] = None):
+        self.cwd = cwd
+        self.src_dir = src_dir
+        self.pend: "deque[Tuple[str, bool]]" = deque()
+        self._reset()
+
+    def _reset(self) -> None:
+        self.mode = "idle"       # idle | panic_seen | goroutine | frames
+        self.raw_msg = ""
+        self.pending_func = ""   # function name waiting for its file:line pair
+        self.frames: List[StackFrame] = []
+        self.trace_lines: List[Tuple[str, bool]] = []
+        self.trunc_any = False
+
+    def feed(self, line: str, truncated: bool) -> List[ParsedTrace]:
+        self.pend.append((line, truncated))
+        return self._drain()
+
+    def finish(self) -> List[ParsedTrace]:
+        out = self._drain()
+        if self.mode in ("goroutine", "frames"):
+            out.append(self._make_trace())
+        self._reset()
+        return out
+
+    def _drain(self) -> List[ParsedTrace]:
+        out: List[ParsedTrace] = []
+        stall = 0
+        while self.pend:
+            line, truncated = self.pend[0]
+            if self._step(line, truncated, out):
+                self.pend.popleft()
+                stall = 0
+            else:
+                stall += 1
+                if stall > 10_000:
+                    raise RuntimeError("GoTraceStream made no progress")
+        return out
+
+    def _step(self, line: str, truncated: bool, out: List[ParsedTrace]) -> bool:
+        stripped = line.strip()
+
+        if self.mode == "idle":
+            m = RE_GO_PANIC_HEADER.match(stripped)
+            if m:
+                self.raw_msg = m.group(1).strip()
+                self.mode = "panic_seen"
+                self.trace_lines = [(line, truncated)]
+                self.trunc_any = truncated
+            return True
+
+        if self.mode == "panic_seen":
+            # Allow blank line between panic header and goroutine header
+            if not stripped:
+                self.trace_lines.append((line, truncated))
+                return True
+            gm = RE_GO_GOROUTINE.match(stripped)
+            if gm:
+                self.trace_lines.append((line, truncated))
+                self.trunc_any = self.trunc_any or truncated
+                self.mode = "goroutine"
+                return True
+            # Non-goroutine continuation — treat as additional message context
+            self.raw_msg = (self.raw_msg + " " + stripped).strip() if self.raw_msg else stripped
+            self.trace_lines.append((line, truncated))
+            return True
+
+        if self.mode == "goroutine":
+            # Waiting for first function frame
+            if not stripped:
+                return True
+            # Check for file:line (shouldn't happen yet, but be safe)
+            fm = RE_GO_FILE_LINE.match(line)
+            if fm:
+                # orphan file line with no function; skip
+                self.trace_lines.append((line, truncated))
+                return True
+            # Another goroutine header — stop collecting frames for first goroutine,
+            # emit trace (we only fingerprint the panicking goroutine)
+            gm = RE_GO_GOROUTINE.match(stripped)
+            if gm:
+                out.append(self._make_trace())
+                self._reset()
+                return False  # re-dispatch: will become a new panic (or idle)
+            # Should be a function name
+            func_m = RE_GO_FUNC.match(stripped)
+            if func_m:
+                self.pending_func = func_m.group(1)
+                self.trace_lines.append((line, truncated))
+                self.mode = "frames"
+                self.trunc_any = self.trunc_any or truncated
+                return True
+            # Something else (e.g. "exit status 2") — end of panic dump
+            out.append(self._make_trace())
+            self._reset()
+            return False
+
+        # mode == "frames"
+        if not stripped:
+            # blank line after frames = goroutine separator or end
+            # peek: if next non-blank is another goroutine, emit now
+            out.append(self._make_trace())
+            self._reset()
+            return True
+
+        fm = RE_GO_FILE_LINE.match(line)
+        if fm:
+            filepath = fm.group(1)
+            line_no = int(fm.group(2))
+            norm_p, in_proj = normalize_frame_path(filepath, self.cwd, self.src_dir)
+            # Vendor check: runtime/ and vendor/ are not project frames
+            lower_fp = filepath.lower().replace("\\", "/")
+            is_runtime = lower_fp.startswith("runtime/") or "/vendor/" in lower_fp or lower_fp.startswith("vendor/")
+            if is_runtime:
+                in_proj = False
+            self.frames.append(StackFrame(
+                filepath=filepath,
+                line_number=line_no,
+                function_name=self.pending_func,
+                is_in_project=in_proj,
+                normalized_path=norm_p,
+            ))
+            self.pending_func = ""
+            self.trace_lines.append((line, truncated))
+            self.trunc_any = self.trunc_any or truncated
+            return True
+
+        # Could be another function line (next frame pair)
+        gm = RE_GO_GOROUTINE.match(stripped)
+        if gm:
+            # Second goroutine: emit first, reset (don't parse remaining goroutines)
+            out.append(self._make_trace())
+            self._reset()
+            return False
+
+        func_m = RE_GO_FUNC.match(stripped)
+        if func_m:
+            # If there's a pending_func with no file line (truncated), add a partial frame
+            if self.pending_func:
+                self.frames.append(StackFrame(
+                    filepath="",
+                    line_number=0,
+                    function_name=self.pending_func,
+                    is_in_project=False,
+                    normalized_path="",
+                ))
+            self.pending_func = func_m.group(1)
+            self.trace_lines.append((line, truncated))
+            self.trunc_any = self.trunc_any or truncated
+            return True
+
+        # Unrecognized line (e.g. "exit status 2") — end of dump
+        out.append(self._make_trace())
+        self._reset()
+        return False
+
+    def _normalize_go_msg(self, msg: str) -> str:
+        """Normalize Go panic message: strip ptr addresses and dynamic IDs."""
+        msg = RE_GO_PTR.sub("<PTR>", msg)
+        msg, _ = normalize_message(msg)
+        return msg
+
+    def _make_trace(self) -> ParsedTrace:
+        raw_block = "\n".join(l for l, _ in self.trace_lines)
+        norm_msg = self._normalize_go_msg(self.raw_msg)
+        # If pending_func has no file pair (truncated stack), add partial frame
+        if self.pending_func and (not self.frames or self.frames[-1].function_name != self.pending_func):
+            self.frames.append(StackFrame(
+                filepath="",
+                line_number=0,
+                function_name=self.pending_func,
+                is_in_project=False,
+                normalized_path="",
+            ))
+        trace = ParsedTrace(
+            runtime="go",
+            error_type="GoPanic",
+            original_message=self.raw_msg,
+            normalized_message=norm_msg,
+            frames=self.frames,
+            raw_text=raw_block,
+            is_truncated=self.trunc_any or bool(self.pending_func),
+        )
+        trace.fingerprint = trace.compute_fingerprint()
+        return trace
+
+
+
 class JavaTraceStream:
     """Line-fed Java stack trace parser with Caused-by chaining support (TSK-025)."""
 
@@ -800,9 +1025,11 @@ def stream_analyze(
     py = PythonTraceStream(cwd, src_dir)
     node = NodeTraceStream(cwd, src_dir)
     java = JavaTraceStream(cwd, src_dir)
+    go = GoTraceStream(cwd, src_dir)
     fpy: "dict[str, IncidentGroup]" = {}
     fnode: "dict[str, IncidentGroup]" = {}
     fjava: "dict[str, IncidentGroup]" = {}
+    fgo: "dict[str, IncidentGroup]" = {}
     fforeign: "dict[str, IncidentGroup]" = {}
     total_lines = 0
     total_exceptions = 0
@@ -817,20 +1044,19 @@ def stream_analyze(
         jl = java.feed(line, truncated)
         fold_traces(jl, fjava)
         total_exceptions += len(jl)
+        gl = go.feed(line, truncated)
+        fold_traces(gl, fgo)
+        total_exceptions += len(gl)
 
-        # Foreign stack detection (Go panic, fatal errors, core dumps)
+        # Foreign stack detection (fatal errors, core dumps — Go panic handled by GoTraceStream)
         fmatch = RE_FOREIGN_HEADER.match(line.strip())
-        if fmatch and not tl and not nl and not jl:
+        if fmatch and not tl and not nl and not jl and not gl:
             header_str = line.strip()
-            err_type = "ForeignPanic"
+            err_type = "FatalError"
             if "SIGSEGV" in header_str:
                 err_type = "SIGSEGV"
             elif "SIGABRT" in header_str:
                 err_type = "SIGABRT"
-            elif "panic:" in header_str:
-                err_type = "GoPanic"
-            elif "fatal error:" in header_str:
-                err_type = "FatalError"
 
             ftrace = ParsedTrace(
                 runtime="foreign",
@@ -854,8 +1080,11 @@ def stream_analyze(
     jl2 = java.finish()
     fold_traces(jl2, fjava)
     total_exceptions += len(jl2)
+    gl2 = go.finish()
+    fold_traces(gl2, fgo)
+    total_exceptions += len(gl2)
 
-    merged = {**fpy, **fnode, **fjava, **fforeign}
+    merged = {**fpy, **fnode, **fjava, **fgo, **fforeign}
     if scrub_secrets:
         for g in merged.values():
             g.representative_trace = scrub_secrets_text(g.representative_trace)
