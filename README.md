@@ -1,6 +1,6 @@
 # Pra-Effect
 
-> Zero-dependency local CLI for parsing, deduplicating, and fingerprinting Python, Node.js, and Java error stack traces with low-memory streaming ingestion ($O(1)$ reader, $O(G)$ unique-group memory), ReDoS resilience, SQLite persistence, and standalone HTML reporting with sandboxed source previews.
+> Zero-dependency local CLI for parsing, deduplicating, and fingerprinting Python, Node.js, Java, Go, Rust, and JSONL error stack traces with low-memory streaming ingestion ($O(1)$ reader, $O(G)$ unique-group memory), ReDoS resilience, SQLite persistence, and standalone HTML reporting with sandboxed source previews.
 
 [![PyPI Version](https://img.shields.io/pypi/v/pra-effect.svg)](https://pypi.org/project/pra-effect/)
 [![Python Version](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/)
@@ -13,7 +13,7 @@
 
 - **Zero Third-Party Dependencies:** Pure Python standard library (`argparse`, `hashlib`, `html`, `re`, `sqlite3`, `pathlib`).
 - **Resilient Fingerprinting (`fingerprint_v1`):** Normalizes dynamic memory addresses (`0x7f...`), variable line numbers, timestamps, UUIDs, and ephemeral ports so identical incidents aggregate into one canonical hash.
-- **Polyglot Runtime Support:** Natively parses Python tracebacks (standard, chained exceptions, multiline messages), Node.js call stacks (V8 engine), and Java stack traces (`Caused by:` exception chaining, vendor package suppression). Automatically flags unrecognized foreign crash dumps.
+- **Polyglot Runtime Support:** Natively parses Python tracebacks (standard, chained exceptions, multiline messages), Node.js call stacks (V8 engine), Java stack traces (`Caused by:` exception chaining, vendor package suppression), Go panics (`GoTraceStream`), Rust backtraces (`RustTraceStream`), and structured JSON lines (`JsonlStream`). Automatically flags unrecognized foreign crash dumps.
 - **Diagnostic Source Previews (`--src`):** Embeds sandboxed 5-line source code context around target frames in HTML incident reports with strict directory containment check (`os.path.commonpath`).
 - **CI & Regression Quality Gates:**
   - `--fail-if-groups-exceed <N>` to guard against incident sprawl.

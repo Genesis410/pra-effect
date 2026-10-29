@@ -4,6 +4,17 @@ Semua perubahan berarti bagi Pra-Effect tercatat di sini. Format mengikuti
 [Keep a Changelog](https://keepachangelog.com/) dan pemantauan
 [Semantic Versioning](https://semver.org/).
 
+## [1.4.0] - 2026-10-29
+### Added
+- **Go Panic Streaming Parser (`GoTraceStream`):** Native streaming parser for Go runtime panics, extracting goroutine IDs, panic messages, source locations, and function frames with interleaved log tolerance.
+- **Rust Backtrace Streaming Parser (`RustTraceStream`):** Streaming parser for Rust panic backtraces (`stack backtrace:`), normalizing symbol hashes (`::h[0-9a-f]{16}`) and extracting frame paths.
+- **Structured JSON Lines Parser (`JsonlStream`):** Streaming parser for newline-delimited JSON logs containing structured error levels and nested stack traces.
+- **End-to-End Stability Test Suite:** 16 user flow tests (`test_e2e_v14.py`) validating polyglot streaming ingestion across all 6 runtimes and regression gates.
+
+### Fixed
+- **Bearer Secret Redaction:** Updated `RE_BEARER_AUTH` to support optional colon separators (`Bearer: <token>`).
+- **Interleaved Log Noise Tolerance in Go Panic:** Maintained frame collection context across up to 2 lines of non-frame noise without premature trace reset.
+
 ## [1.3.0] - 2026-10-25
 ### Added
 - **Java Stack Trace Support:** Streaming parser for Java exceptions (`JavaTraceStream`, `RE_JAVA_*`), including standard multiline stack traces and chained exception context (`Caused by:` -> `ParsedTrace.chain`).

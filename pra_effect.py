@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Iterable, Iterator, List, Optional, Sequence, Tuple
 
 FINGERPRINT_VERSION = "fingerprint_v1"
-__version__ = "1.3.0"
+__version__ = "1.4.0"
 MAX_LINE_LENGTH = 4096
 MAX_CONTINUATION_LINES = 5
 MAX_INTERLEAVED_LINES = 2
@@ -52,7 +52,7 @@ RE_CONSECUTIVE_WHITESPACE = re.compile(r"\s+")
 RE_ANSI = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
 
 # TSK-023 / v1.1.0: Secret redaction patterns
-RE_BEARER_AUTH = re.compile(r"(?i)\b(bearer\s+)([A-Za-z0-9\-_\.=]{16,})")
+RE_BEARER_AUTH = re.compile(r"(?i)\b(bearer\s*:?\s*)([A-Za-z0-9\-_\.=]{16,})")
 RE_BASIC_AUTH_URI = re.compile(r"(?i)\b([a-z][a-z0-9+.-]*://)([^:\s/@]+):([^@\s/]+)@")
 RE_API_KEY_KV = re.compile(r"(?i)\b(api[_-]?key|secret|token|password|passwd|auth)[_-]?(?:key)?\s*[:=]\s*['\"]?([A-Za-z0-9_\-\.]{8,})['\"]?")
 RE_AWS_KEY = re.compile(r"\b(AKIA[0-9A-Z]{16})\b")
@@ -633,6 +633,7 @@ class GoTraceStream:
         self.frames: List[StackFrame] = []
         self.trace_lines: List[Tuple[str, bool]] = []
         self.trunc_any = False
+        self.interleaved = 0     # tolerance counter for non-frame noise in frames mode
 
     def feed(self, line: str, truncated: bool) -> List[ParsedTrace]:
         self.pend.append((line, truncated))
@@ -719,11 +720,15 @@ class GoTraceStream:
 
         # mode == "frames"
         if not stripped:
-            # blank line after frames = goroutine separator or end
-            # peek: if next non-blank is another goroutine, emit now
+            # blank line: consume it, continue in frames mode
+            self.interleaved = 0
+            return True
+
+        # New panic header — emit current trace, restart
+        if RE_GO_PANIC_HEADER.match(stripped):
             out.append(self._make_trace())
             self._reset()
-            return True
+            return False
 
         fm = RE_GO_FILE_LINE.match(line)
         if fm:
@@ -743,6 +748,7 @@ class GoTraceStream:
                 normalized_path=norm_p,
             ))
             self.pending_func = ""
+            self.interleaved = 0  # valid frame resets interleaved counter
             self.trace_lines.append((line, truncated))
             self.trunc_any = self.trunc_any or truncated
             return True
@@ -767,14 +773,23 @@ class GoTraceStream:
                     normalized_path="",
                 ))
             self.pending_func = func_m.group(1)
+            self.interleaved = 0
             self.trace_lines.append((line, truncated))
             self.trunc_any = self.trunc_any or truncated
             return True
 
-        # Unrecognized line (e.g. "exit status 2") — end of dump
-        out.append(self._make_trace())
-        self._reset()
-        return False
+        # Unrecognized line in frames mode (e.g. "Authorization: Bearer..." or
+        # "exit status 2"): include in trace_lines (preserves raw context for
+        # scrubbing) but count it as interleaved noise. After MAX_INTERLEAVED_LINES
+        # consecutive unrecognized lines, emit and reset.
+        self.interleaved += 1
+        if self.interleaved > MAX_INTERLEAVED_LINES:
+            out.append(self._make_trace())
+            self._reset()
+            return False
+        self.trace_lines.append((line, truncated))
+        self.trunc_any = self.trunc_any or truncated
+        return True
 
     def _normalize_go_msg(self, msg: str) -> str:
         """Normalize Go panic message: strip ptr addresses and dynamic IDs."""

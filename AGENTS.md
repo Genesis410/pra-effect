@@ -29,10 +29,10 @@ Untuk menghemat quota, TPM, dan context window model AI:
 ---
 
 ## 3. Current State & Version Roadmap
-- **Published on GitHub & PyPI:** `v1.0.1` (Patch release).
-- **Current Development Version:** `v1.2.0` (Run Comparison & Historical Diffing: `pra-effect diff <run_a> <run_b>`, `--fail-on-new`).
+- **Published on GitHub & PyPI:** `v1.4.0` (Polyglot Expansion: Go Panic, Rust Backtrace, JSONL streaming parsers).
 - **Target Selanjutnya:**
-  - `TSK-025` -> `v1.3.0` (Diagnostic Intelligence: Foreign Stacks, Java Parser, `--src` preview).
+  - `TSK-027` -> `v1.4.1` (Multi-Parser Stabilization & Regression Hardening).
+  - `TSK-028` -> `v1.5.0` (Unified Mode Launcher + Lightweight GUI MVP).
 
 ---
 

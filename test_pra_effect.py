@@ -36,7 +36,7 @@ def test_release_version_consistency():
     assert pra_effect.__version__ == pkg_version, (
         f"version drift: CLI __version__={pra_effect.__version__} != pyproject={pkg_version}"
     )
-    assert pkg_version == "1.3.0", f"release expected 1.3.0, got {pkg_version}"
+    assert pkg_version == "1.4.0", f"release expected 1.4.0, got {pkg_version}"
 
 FIXTURE_PYTHON_LOG = """
 INFO 2026-10-24 10:00:01 Starting service
