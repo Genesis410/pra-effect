@@ -226,7 +226,7 @@ MIT License. See [LICENSE](LICENSE) for details.
 
 ## Release & Changelog
 
-See [CHANGELOG.md](CHANGELOG.md) for the version history. Current release: `1.3.0`.
+See [CHANGELOG.md](CHANGELOG.md) for the version history. Current release: `1.4.1`.
 
 Version consistency across the package (`pyproject.toml`), the CLI (`--version`), and
 the git tag is enforced by `test_release_version_consistency`.
