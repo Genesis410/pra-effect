@@ -32,8 +32,8 @@ Traceback (most recent call last):
   File "/app/src/api.py", line {l}, in handle_request
     payload = process(item_{n})
   File "/app/src/worker.py", line {l2}, in process
-    raise ValueError("invalid item {n} for request-id: 123e4567-e89b-12d3-a456-42661417{n:04d}")
-ValueError: invalid item {n} for request-id: 123e4567-e89b-12d3-a456-42661417{n:04d}
+    raise ValueError("invalid item {n} for request-id: 123e4567-e89b-12d3-a456-{u:012d}")
+ValueError: invalid item {n} for request-id: 123e4567-e89b-12d3-a456-{u:012d}
 
 """
 
@@ -72,12 +72,18 @@ def peak_rss_bytes():
 
 
 def build_log(target_mb: float) -> str:
-    """Byte-identical to the pre-streaming baseline generator."""
-    block = BLOCK.format(n=1, l=42, l2=17)
+    """Byte-identical to baseline generator with valid 12-hex UUID tail."""
+    block = BLOCK.format(n=1, l=42, l2=17, u=1)
     repeats = int((target_mb * 1024 * 1024) // len(block)) + 1
     # Vary ids per block so grouping work is representative (not one giant duplicate)
     parts = [
-        BLOCK.format(n=i, l=40 + (i % 900), l2=10 + (i % 300)) for i in range(repeats)
+        BLOCK.format(
+            n=i,
+            l=40 + (i % 900),
+            l2=10 + (i % 300),
+            u=i % 1_000_000_000_000,
+        )
+        for i in range(repeats)
     ]
     return "".join(parts)
 

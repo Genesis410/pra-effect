@@ -29,9 +29,8 @@ Untuk menghemat quota, TPM, dan context window model AI:
 ---
 
 ## 3. Current State & Version Roadmap
-- **Published on GitHub & PyPI:** `v1.4.1` (API Parity, HTML Badges & Multi-Parser Test Suite).
+- **Published on GitHub & PyPI:** `v1.4.2` (ReDoS Defense, Cross-Parser Isolation, JSONL Nested Fields).
 - **Target Selanjutnya:**
-  - `TSK-027B` -> `v1.4.2` (JSONL Nested Fields & Polyglot Edge Cases).
   - `TSK-027C` -> `v1.4.3` (Multi-Stream Benchmarking & Hardening Gate).
   - `TSK-028` -> `v1.5.0` (Unified Mode Launcher + Lightweight GUI MVP).
 

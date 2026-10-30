@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Iterable, Iterator, List, Optional, Sequence, Tuple
 
 FINGERPRINT_VERSION = "fingerprint_v1"
-__version__ = "1.4.1"
+__version__ = "1.4.2"
 MAX_LINE_LENGTH = 4096
 MAX_CONTINUATION_LINES = 5
 MAX_INTERLEAVED_LINES = 2
@@ -51,10 +51,10 @@ RE_CONSECUTIVE_WHITESPACE = re.compile(r"\s+")
 # TSK-022 / v1.0.1: ANSI escape code stripping in stream reader
 RE_ANSI = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
 
-# TSK-023 / v1.1.0: Secret redaction patterns
-RE_BEARER_AUTH = re.compile(r"(?i)\b(bearer\s*:?\s*)([A-Za-z0-9\-_\.=]{16,})")
+# TSK-023 / v1.1.0 / v1.4.2: Secret redaction patterns (hardened against ReDoS)
+RE_BEARER_AUTH = re.compile(r"(?i)\b(bearer(?:\s*:\s*|\s+))([A-Za-z0-9\-_\.=]{16,})")
 RE_BASIC_AUTH_URI = re.compile(r"(?i)\b([a-z][a-z0-9+.-]*://)([^:\s/@]+):([^@\s/]+)@")
-RE_API_KEY_KV = re.compile(r"(?i)\b(api[_-]?key|secret|token|password|passwd|auth)[_-]?(?:key)?\s*[:=]\s*['\"]?([A-Za-z0-9_\-\.]{8,})['\"]?")
+RE_API_KEY_KV = re.compile(r"(?i)\b(api[_-]?key|secret(?:[_-]?key)?|token(?:[_-]?key)?|password|passwd|auth(?:[_-]?key)?)\s*[:=]\s*['\"]?([A-Za-z0-9_\-\.]{8,})['\"]?")
 RE_AWS_KEY = re.compile(r"\b(AKIA[0-9A-Z]{16})\b")
 RE_JWT = re.compile(r"\beyJ[A-Za-z0-9-_]+\.eyJ[A-Za-z0-9-_]+\.[A-Za-z0-9-_]+\b")
 
@@ -76,12 +76,13 @@ RE_LOG_LEVEL_LINE = re.compile(
 )
 RE_TIMESTAMP_LINE = re.compile(r"^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:[.,]\d+)?\s+\S")
 
-# Node.js stack pattern
+# Node.js stack pattern (TSK-027B: disambiguated from Java and hardened against ReDoS)
+# ponytail: allows at most 1 package/module dot (e.g. auth.TokenError); upgrade to full AST if nested JS namespaces needed
 RE_NODE_ERROR_HEADER = re.compile(
-    r"^([a-zA-Z0-9_\.]*?Error|[a-zA-Z0-9_\.]*?Exception)(?::\s*(.*))?$"
+    r"^((?:[a-zA-Z0-9_$]+\.)?[a-zA-Z0-9_$]*(?:Error|Exception))(?::\s*(.*))?$"
 )
 RE_NODE_FRAME = re.compile(
-    r"^\s*at (?:(.+?)\s+\()?([^\s\(\)]+?):(\d+):(\d+)\)?$"
+    r"^\s*at (?:(?:async\s+)?(.+?)\s+\(([^()]+):(\d+):(\d+)\)|(?:async\s+)?([^\s()]+):(\d+):(\d+))$"
 )
 
 # Java stack patterns (TSK-025)
@@ -100,26 +101,26 @@ RE_FOREIGN_HEADER = re.compile(
     r"^(?:fatal error:\s*(.*)|SIGSEGV|SIGABRT)"
 )
 
-# Go panic streaming patterns (TSK-026A)
+# Go panic streaming patterns (TSK-026A / v1.4.2 TSK-027B)
 # Header: "panic: <message>" or "panic(<type>): <msg>"
 RE_GO_PANIC_HEADER = re.compile(r"^panic(?:\([^)]*\))?:\s*(.*)")
 # Goroutine header: "goroutine 1 [running]:"  (any status)
 RE_GO_GOROUTINE = re.compile(r"^goroutine\s+(\d+)\s+\[([^\]]+)\]:$")
-# Frame function: "main.foo(...)" or "runtime.gopanic(...)"
-RE_GO_FUNC = re.compile(r"^([a-zA-Z0-9_./\(\)]*[a-zA-Z0-9_])(?:\(.*\))?$")
-# Frame file line: "\t/path/to/file.go:42 +0x5e"
-RE_GO_FILE_LINE = re.compile(r"^\s+(.+\.go):(\d+)(?:\s+\+0x[0-9a-fA-F]+)?$")
+# Frame function: "main.foo(...)" or "runtime.gopanic(...)" or "main.(*Server).Serve(...)"
+RE_GO_FUNC = re.compile(r"^([a-zA-Z0-9_./]+(?:\.\(\*?[a-zA-Z0-9_.]+\))?(?:\.[a-zA-Z0-9_]+)*)(?:\([^)]*\))?$")
+# Frame file line: "\t/path/to/file.go:42 +0x5e" or "\tC:/path/file.go:42" (Windows/POSIX safe, zero colon ReDoS)
+RE_GO_FILE_LINE = re.compile(r"^\s+((?:[a-zA-Z]:)?[^:\r\n]+?\.go):(\d+)(?:\s+\+0x[0-9a-fA-F]+)?$")
 # Normalization: goroutine ID and memory addresses
 RE_GO_PTR = re.compile(r"\b0x[0-9a-fA-F]+\b")
 RE_GO_GOROUTINE_ID = re.compile(r"\bgoroutine\s+\d+\b")
 
-# Rust panic streaming patterns (TSK-026B)
+# Rust panic streaming patterns (TSK-026B / v1.4.2 TSK-027B)
 # Header: "thread 'main' panicked at src/main.rs:12:5" or bare "panicked at <loc>"
 RE_RUST_PANIC_HEADER = re.compile(
-    r"^thread\s+'[^']+'\s+panicked(?:\s+at\s+(.+?))?(?:$|\s)"
+    r"^thread\s+'[^']+'\s+panicked(?::?\s+(?:at\s+)?(.*))?$"
 )
 # Also bare "panicked at <loc>" (release builds without thread name)
-RE_RUST_PANIC_BARE = re.compile(r"^panicked(?:\s+at\s+(.+?))?(?:$|\s)")
+RE_RUST_PANIC_BARE = re.compile(r"^panicked(?::?\s+(?:at\s+)?(.*))?$")
 # Frame: "   0: <symbol>   1: <symbol>" — digits + colon + name (with optional demangling)
 RE_RUST_FRAME = re.compile(r"^\s*\d+:\s+(\S.*)$")
 # Optional location suffix on frame: "... at src/main.rs:12:5)" or "... (at src/main.rs:12:5)"
@@ -500,9 +501,9 @@ class NodeTraceStream:
 
     def finish(self) -> List[ParsedTrace]:
         out = self._drain()
-        if self.mode == "frames":
+        if self.mode == "frames" and self.frames:
             out.append(self._make_trace())
-        # mode "await": header with no `at ` frame — dropped, as before.
+        # mode "await" or 0 frames: header without valid frames dropped (prevents Java cross-collision)
         self._reset()
         return out
 
@@ -550,8 +551,14 @@ class NodeTraceStream:
             return True  # blank inside stack: consumed, never in raw_text
         frame_match = RE_NODE_FRAME.match(stripped)
         if frame_match:
-            fn_name, raw_fpath, line_no, _col = frame_match.groups()
-            fn_name = fn_name or "<anonymous>"
+            if frame_match.group(2) is not None:
+                fn_name = frame_match.group(1) or "<anonymous>"
+                raw_fpath = frame_match.group(2)
+                line_no = frame_match.group(3)
+            else:
+                fn_name = "<anonymous>"
+                raw_fpath = frame_match.group(5)
+                line_no = frame_match.group(6)
             norm_p, in_proj = normalize_frame_path(raw_fpath, self.cwd, self.src_dir)
             self.frames.append(
                 StackFrame(
@@ -568,7 +575,8 @@ class NodeTraceStream:
             return True
 
         if RE_NODE_ERROR_HEADER.match(stripped) or RE_PY_TRACE_START.match(stripped):
-            out.append(self._make_trace())
+            if self.frames:
+                out.append(self._make_trace())
             self._reset()
             return False  # new header re-dispatched in idle
 
@@ -576,7 +584,8 @@ class NodeTraceStream:
             self.interleaved += 1
             return True  # interleaved noise: consumed, not in raw_text
 
-        out.append(self._make_trace())
+        if self.frames:
+            out.append(self._make_trace())
         self._reset()
         return False  # the overflowing line re-dispatched in idle
 
@@ -863,14 +872,46 @@ class JsonlTraceStream:
         # Identify error line
         level = str(obj.get("level", "")).lower()
         if level not in self._ERROR_LEVELS:
-            # Also accept "error" key presence with stack/message
-            if "error" not in obj and "stack_trace" not in obj and "msg" not in obj:
+            # Also accept "error" / "err" key presence with stack/message
+            if "error" not in obj and "err" not in obj and "stack_trace" not in obj and "msg" not in obj:
                 return []
 
-        # Extract fields
-        msg = str(obj.get("message", obj.get("msg", obj.get("error", "")))).strip()
-        stack = str(obj.get("stack_trace", obj.get("stack", obj.get("traceback", "")))).strip()
-        err_type_raw = str(obj.get("error_type", obj.get("type", ""))).strip()
+        # TSK-027B: 1-level nested lookup for structured loggers (Pino, Winston, Zap, Logstash)
+        # ponytail: 1-level dict lookup covers production structured loggers without recursive overhead
+        nested: dict = {}
+        for parent_key in ("error", "err", "exception", "context"):
+            val = obj.get(parent_key)
+            if isinstance(val, dict):
+                nested = val
+                break
+
+        # Extract message
+        msg_val = obj.get("message") or obj.get("msg") or nested.get("message") or nested.get("msg")
+        if not msg_val and isinstance(obj.get("error"), str):
+            msg_val = obj.get("error")
+        elif not msg_val and isinstance(nested.get("error"), str):
+            msg_val = nested.get("error")
+        msg = str(msg_val or "").strip()
+
+        # Extract stack trace
+        stack_val = (
+            obj.get("stack_trace")
+            or obj.get("stack")
+            or obj.get("traceback")
+            or nested.get("stack_trace")
+            or nested.get("stack")
+            or nested.get("traceback")
+        )
+        stack = str(stack_val or "").strip()
+
+        # Extract error type
+        err_type_raw = str(
+            obj.get("error_type")
+            or obj.get("type")
+            or nested.get("error_type")
+            or nested.get("type")
+            or ""
+        ).strip()
 
         # Error type: use explicit field, else infer from first line of stack
         if err_type_raw:
@@ -905,8 +946,7 @@ class JsonlTraceStream:
     def finish(self) -> List[ParsedTrace]:
         return []  # stateless — nothing pending
 
-    @staticmethod
-    def _parse_embedded_stack(stack: str) -> List[StackFrame]:
+    def _parse_embedded_stack(self, stack: str) -> List[StackFrame]:
         """Parse embedded multi-line stack trace from a JSONL field.
 
         Handles Python, Java, and generic formats found in JSON field values.
@@ -923,28 +963,37 @@ class JsonlTraceStream:
                 fp = m.group(1)
                 ln = int(m.group(2))
                 fn = m.group(3) or ""
+                norm_p, in_proj = normalize_frame_path(fp, self.cwd, self.src_dir)
                 frames.append(StackFrame(
                     filepath=fp, line_number=ln,
                     function_name=fn,
-                    is_in_project=False, normalized_path=fp,
+                    is_in_project=in_proj, normalized_path=norm_p,
                 ))
                 continue
             # Java-style: at pkg.Class.method(File.java:42)
             m = re.match(r"^at\s+([a-zA-Z0-9_.$/]+)\(([^:]+):(\d+)\)", line)
             if m:
+                fp = m.group(2)
+                ln = int(m.group(3))
+                fn = m.group(1)
+                norm_p, in_proj = normalize_frame_path(fp, self.cwd, self.src_dir)
                 frames.append(StackFrame(
-                    filepath=m.group(2), line_number=int(m.group(3)),
-                    function_name=m.group(1),
-                    is_in_project=False, normalized_path=m.group(2),
+                    filepath=fp, line_number=ln,
+                    function_name=fn,
+                    is_in_project=in_proj, normalized_path=norm_p,
                 ))
                 continue
             # Generic Node/Rust: frame lines with file:line pattern
             m = re.match(r"^(?:\d+:\s*)?(\S+)\s+at\s+(\S+):(\d+)", line)
             if m:
+                fp = m.group(2)
+                ln = int(m.group(3))
+                fn = m.group(1)
+                norm_p, in_proj = normalize_frame_path(fp, self.cwd, self.src_dir)
                 frames.append(StackFrame(
-                    filepath=m.group(2), line_number=int(m.group(3)),
-                    function_name=m.group(1),
-                    is_in_project=False, normalized_path=m.group(2),
+                    filepath=fp, line_number=ln,
+                    function_name=fn,
+                    is_in_project=in_proj, normalized_path=norm_p,
                 ))
         return frames
 
@@ -1139,7 +1188,7 @@ class JavaTraceStream:
 
     def finish(self) -> List[ParsedTrace]:
         out = self._drain()
-        if self.mode == "frames":
+        if self.mode == "frames" and self.frames:
             out.append(self._make_trace())
         self._reset()
         return out
@@ -1237,7 +1286,8 @@ class JavaTraceStream:
             return True
 
         if RE_JAVA_HEADER.match(stripped) or RE_PY_TRACE_START.match(stripped) or RE_NODE_ERROR_HEADER.match(stripped):
-            out.append(self._make_trace())
+            if self.frames:
+                out.append(self._make_trace())
             self._reset()
             return False
 
@@ -1245,7 +1295,8 @@ class JavaTraceStream:
             self.interleaved += 1
             return True
 
-        out.append(self._make_trace())
+        if self.frames:
+            out.append(self._make_trace())
         self._reset()
         return False
 

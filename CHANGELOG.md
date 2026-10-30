@@ -4,6 +4,13 @@ Semua perubahan berarti bagi Pra-Effect tercatat di sini. Format mengikuti
 [Keep a Changelog](https://keepachangelog.com/) dan pemantauan
 [Semantic Versioning](https://semver.org/).
 
+## [1.4.2] - 2026-10-30
+### Fixed & Hardened
+- **ReDoS Defense & Linear Regex Matching:** Hardened regex patterns across all runtimes (`RE_NODE_FRAME`, `RE_GO_FUNC`, `RE_GO_FILE_LINE`, `RE_RUST_PANIC_HEADER`, `RE_BEARER_AUTH`, `RE_API_KEY_KV`) to eliminate catastrophic backtracking on adversarial input strings.
+- **Polyglot Cross-Parser Collision Prevention:** Disambiguated `RE_NODE_ERROR_HEADER` from Java package names to prevent false positive Node traces on Java exceptions; enforced strict `len(self.frames) > 0` validation before emitting Node and Java traces.
+- **JSONL Nested Error Fields:** Added non-recursive 1-level dictionary extraction for structured loggers (Pino, Winston, Zap, Logstash) under `error`, `err`, `exception`, and `context` keys.
+- **JSONL Source Path Normalization:** Resolved frame paths in embedded JSONL stacks against `cwd` and `src_dir` for accurate project identification.
+
 ## [1.4.1] - 2026-10-30
 ### Added
 - **TracebackParser API Parity:** Added convenience methods `parse_go_traces()`, `parse_rust_traces()`, and `parse_jsonl_traces()`, with `parse_all()` now aggregating traces across all 6 runtimes (Python, Node, Java, Go, Rust, JSONL).

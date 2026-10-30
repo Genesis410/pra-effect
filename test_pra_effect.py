@@ -36,7 +36,7 @@ def test_release_version_consistency():
     assert pra_effect.__version__ == pkg_version, (
         f"version drift: CLI __version__={pra_effect.__version__} != pyproject={pkg_version}"
     )
-    assert pkg_version == "1.4.1", f"release expected 1.4.1, got {pkg_version}"
+    assert pkg_version == "1.4.2", f"release expected 1.4.2, got {pkg_version}"
 
 FIXTURE_PYTHON_LOG = """
 INFO 2026-10-24 10:00:01 Starting service
@@ -1068,6 +1068,95 @@ ValueError: bad value
         self.assertIn(".badge-go", html)
         self.assertIn(".badge-rust", html)
         self.assertIn(".badge-jsonl", html)
+
+    def test_redos_linear_performance(self):
+        """TSK-027B: verify hardened regex patterns execute linearly on 4KB adversarial inputs."""
+        import time
+        adversarial_4k = "a" * 4096
+        adversarial_words = "at " + ("word " * 600) + "end"
+        adversarial_go_line = "   " + ("dir/" * 400) + "not_a_go_file.txt:123"
+
+        patterns = [
+            (pra_effect.RE_NODE_ERROR_HEADER, adversarial_4k),
+            (pra_effect.RE_NODE_FRAME, adversarial_words),
+            (pra_effect.RE_GO_FUNC, "(" * 200 + "a" * 200 + ")" * 200),
+            (pra_effect.RE_GO_FILE_LINE, adversarial_go_line),
+            (pra_effect.RE_RUST_PANIC_HEADER, "thread 'main' panicked at " + adversarial_words),
+            (pra_effect.RE_BEARER_AUTH, "bearer " + " " * 3000 + "not_token"),
+            (pra_effect.RE_API_KEY_KV, "api_key = " + "x" * 3500),
+        ]
+
+        for rx, test_str in patterns:
+            t0 = time.perf_counter()
+            rx.search(test_str)
+            elapsed_ms = (time.perf_counter() - t0) * 1000
+            self.assertLess(elapsed_ms, 50.0, f"ReDoS hazard detected on pattern {rx.pattern}: took {elapsed_ms:.2f}ms")
+
+    def test_polyglot_cross_parser_isolation(self):
+        """TSK-027B: ensure Java stack traces never produce phantom Node groups and vice versa."""
+        java_log = """
+java.lang.NullPointerException: Order is null
+\tat com.example.OrderService.process(OrderService.java:45)
+\tat com.example.Main.main(Main.java:10)
+"""
+        cwd = Path(".")
+        total_lines, total_ex, groups = pra_effect.stream_analyze(java_log.splitlines(), cwd)
+        self.assertEqual(total_ex, 1)
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(groups[0].runtime, "java")
+        self.assertEqual(groups[0].error_type, "java.lang.NullPointerException")
+        self.assertEqual(len([g for g in groups if g.runtime == "node"]), 0)
+
+        node_log = """
+Error: connection reset by peer
+    at ClientRequest.emit (node:events:517:28)
+    at Socket.socketErrorListener (node:_http_client:501:9)
+"""
+        total_lines2, total_ex2, groups2 = pra_effect.stream_analyze(node_log.splitlines(), cwd)
+        self.assertEqual(total_ex2, 1)
+        self.assertEqual(len(groups2), 1)
+        self.assertEqual(groups2[0].runtime, "node")
+        self.assertEqual(groups2[0].error_type, "Error")
+        self.assertEqual(len([g for g in groups2 if g.runtime == "java"]), 0)
+
+    def test_jsonl_nested_field_lookup(self):
+        """TSK-027B: structured loggers with 1-level nested error/context dicts parse correctly."""
+        import json as _json
+        nested_pino = _json.dumps({
+            "level": "error",
+            "time": 1600000000,
+            "error": {
+                "message": "Token expired or revoked",
+                "type": "AuthError",
+                "stack": 'File "/app/src/auth.py", line 45, in verify'
+            }
+        })
+        nested_winston = _json.dumps({
+            "level": "error",
+            "context": {
+                "msg": "Database query timeout",
+                "type": "QueryTimeout"
+            }
+        })
+        cwd = Path("/app")
+        src_dir = Path("/app/src")
+        parser = pra_effect.JsonlTraceStream(cwd=cwd, src_dir=src_dir)
+        traces = pra_effect._collect_stream(parser, [nested_pino, nested_winston])
+
+        self.assertEqual(len(traces), 2)
+        # Trace 1: Pino nested error
+        t1 = traces[0]
+        self.assertEqual(t1.runtime, "jsonl")
+        self.assertEqual(t1.error_type, "AuthError")
+        self.assertEqual(t1.original_message, "Token expired or revoked")
+        self.assertEqual(len(t1.frames), 1)
+        self.assertEqual(t1.frames[0].filepath, "/app/src/auth.py")
+        self.assertTrue(t1.frames[0].is_in_project)
+
+        # Trace 2: Winston nested context
+        t2 = traces[1]
+        self.assertEqual(t2.error_type, "QueryTimeout")
+        self.assertEqual(t2.original_message, "Database query timeout")
 
 
 if __name__ == "__main__":
