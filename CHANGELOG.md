@@ -4,6 +4,11 @@ Semua perubahan berarti bagi Pra-Effect tercatat di sini. Format mengikuti
 [Keep a Changelog](https://keepachangelog.com/) dan pemantauan
 [Semantic Versioning](https://semver.org/).
 
+## [1.4.1] - 2026-10-30
+### Added
+- **TracebackParser API Parity:** Added convenience methods `parse_go_traces()`, `parse_rust_traces()`, and `parse_jsonl_traces()`, with `parse_all()` now aggregating traces across all 6 runtimes (Python, Node, Java, Go, Rust, JSONL).
+- **HTML Report Polyglot Badges:** Added CSS styling for `.badge-go` (#00add8), `.badge-rust` (#de5526), and `.badge-jsonl` (#a855f7).
+
 ## [1.4.0] - 2026-10-29
 ### Added
 - **Go Panic Streaming Parser (`GoTraceStream`):** Native streaming parser for Go runtime panics, extracting goroutine IDs, panic messages, source locations, and function frames with interleaved log tolerance.

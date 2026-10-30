@@ -36,7 +36,7 @@ def test_release_version_consistency():
     assert pra_effect.__version__ == pkg_version, (
         f"version drift: CLI __version__={pra_effect.__version__} != pyproject={pkg_version}"
     )
-    assert pkg_version == "1.4.0", f"release expected 1.4.0, got {pkg_version}"
+    assert pkg_version == "1.4.1", f"release expected 1.4.1, got {pkg_version}"
 
 FIXTURE_PYTHON_LOG = """
 INFO 2026-10-24 10:00:01 Starting service
@@ -1044,6 +1044,30 @@ ValueError: bad value
         traces = pra_effect._collect_stream(pra_effect.GoTraceStream(cwd), log.splitlines())
         # No goroutine header → no trace emitted (panic alone is not actionable)
         self.assertEqual(len(traces), 0)
+
+    def test_traceback_parser_polyglot_parity(self):
+        """TSK-027: TracebackParser supports all 6 runtimes via parse_all and specific methods."""
+        parser = pra_effect.TracebackParser()
+        go_log = "panic: err\n\ngoroutine 1 [running]:\nmain.main()\n\t/main.go:1\n\n"
+        rust_log = "thread 'main' panicked at src/main.rs:1:1\nerr\nstack backtrace:\n   0: std::panic\n   1: myapp::main (at src/main.rs:1:1)\n"
+        import json as _json
+        jsonl_log = _json.dumps({"level": "error", "message": "fail", "error_type": "Err"})
+
+        self.assertEqual(len(parser.parse_go_traces(go_log)), 1)
+        self.assertEqual(len(parser.parse_rust_traces(rust_log)), 1)
+        self.assertEqual(len(parser.parse_jsonl_traces(jsonl_log)), 1)
+
+        combined = f"{FIXTURE_PYTHON_LOG}\n{go_log}\n{rust_log}\n{jsonl_log}"
+        all_traces = parser.parse_all(combined)
+        runtimes = {t.runtime for t in all_traces}
+        self.assertTrue({"python", "go", "rust", "jsonl"}.issubset(runtimes))
+
+    def test_html_report_polyglot_badges(self):
+        """TSK-027: HTML report includes badge styling for go, rust, and jsonl."""
+        html = pra_effect.generate_html_report(10, 1, [], 0.01)
+        self.assertIn(".badge-go", html)
+        self.assertIn(".badge-rust", html)
+        self.assertIn(".badge-jsonl", html)
 
 
 if __name__ == "__main__":

@@ -30,8 +30,10 @@ Untuk menghemat quota, TPM, dan context window model AI:
 
 ## 3. Current State & Version Roadmap
 - **Published on GitHub & PyPI:** `v1.4.0` (Polyglot Expansion: Go Panic, Rust Backtrace, JSONL streaming parsers).
+- **Current Development Version:** `v1.4.1` (API Parity, HTML Badges & Multi-Parser Test Suite: `TracebackParser.parse_all()`, `.badge-{go,rust,jsonl}`).
 - **Target Selanjutnya:**
-  - `TSK-027` -> `v1.4.1` (Multi-Parser Stabilization & Regression Hardening).
+  - `TSK-027B` -> `v1.4.2` (JSONL Nested Fields & Polyglot Edge Cases).
+  - `TSK-027C` -> `v1.4.3` (Multi-Stream Benchmarking & Hardening Gate).
   - `TSK-028` -> `v1.5.0` (Unified Mode Launcher + Lightweight GUI MVP).
 
 ---

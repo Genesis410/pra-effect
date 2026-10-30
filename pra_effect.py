@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Iterable, Iterator, List, Optional, Sequence, Tuple
 
 FINGERPRINT_VERSION = "fingerprint_v1"
-__version__ = "1.4.0"
+__version__ = "1.4.1"
 MAX_LINE_LENGTH = 4096
 MAX_CONTINUATION_LINES = 5
 MAX_INTERLEAVED_LINES = 2
@@ -1551,11 +1551,26 @@ class TracebackParser:
         """Whole-text convenience API — thin wrapper over the streaming machine (TSK-025)."""
         return _collect_stream(JavaTraceStream(self.cwd, self.src_dir), text.splitlines())
 
+    def parse_go_traces(self, text: str) -> List[ParsedTrace]:
+        """Whole-text convenience API — thin wrapper over the streaming machine (TSK-026A)."""
+        return _collect_stream(GoTraceStream(self.cwd, self.src_dir), text.splitlines())
+
+    def parse_rust_traces(self, text: str) -> List[ParsedTrace]:
+        """Whole-text convenience API — thin wrapper over the streaming machine (TSK-026B)."""
+        return _collect_stream(RustTraceStream(self.cwd, self.src_dir), text.splitlines())
+
+    def parse_jsonl_traces(self, text: str) -> List[ParsedTrace]:
+        """Whole-text convenience API — thin wrapper over the streaming machine (TSK-026C)."""
+        return _collect_stream(JsonlTraceStream(self.cwd, self.src_dir), text.splitlines())
+
     def parse_all(self, text: str) -> List[ParsedTrace]:
         py_traces = self.parse_python_traces(text)
         node_traces = self.parse_node_traces(text)
         java_traces = self.parse_java_traces(text)
-        return py_traces + node_traces + java_traces
+        go_traces = self.parse_go_traces(text)
+        rust_traces = self.parse_rust_traces(text)
+        jsonl_traces = self.parse_jsonl_traces(text)
+        return py_traces + node_traces + java_traces + go_traces + rust_traces + jsonl_traces
 
 
 def group_traces(traces: Iterable[ParsedTrace]) -> List[IncidentGroup]:
@@ -2010,6 +2025,9 @@ def generate_html_report(
         .badge-node {{ background: rgba(34, 197, 94, 0.2); color: var(--accent-node); border: 1px solid var(--accent-node); }}
         .badge-python {{ background: rgba(59, 130, 246, 0.2); color: var(--accent-python); border: 1px solid var(--accent-python); }}
         .badge-java {{ background: rgba(176, 114, 25, 0.2); color: #b07219; border: 1px solid #b07219; }}
+        .badge-go {{ background: rgba(0, 173, 216, 0.2); color: #00add8; border: 1px solid #00add8; }}
+        .badge-rust {{ background: rgba(222, 85, 38, 0.2); color: #de5526; border: 1px solid #de5526; }}
+        .badge-jsonl {{ background: rgba(168, 85, 247, 0.2); color: #a855f7; border: 1px solid #a855f7; }}
         .badge-foreign {{ background: rgba(239, 68, 68, 0.2); color: #ef4444; border: 1px solid #ef4444; }}
         .error-type {{ font-size: 1.1rem; font-weight: bold; margin-left: 0.5rem; }}
         .fingerprint {{ font-family: monospace; color: var(--muted); font-size: 0.85rem; margin-left: 0.5rem; }}
